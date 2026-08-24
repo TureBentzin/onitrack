@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import os
-import shutil
-import subprocess
+import inspect
 from pathlib import Path
 from typing import Any
 
+from onitrack.auth import _anisette_libs_path, _close_account
+from onitrack.ids import IDSRegistrationError, register_ids
 from onitrack.people import load_or_create_device_identity
 from onitrack.state import (
     SecretStoreError,
@@ -16,8 +15,6 @@ from onitrack.state import (
     write_secret_section,
 )
 
-APPLE_HELPER_ENV = "ONITRACK_APPLE_HELPER"
-APPLE_HELPER_DEFAULT = "onitrack-apple-helper"
 APNS_TOPICS = (
     "com.apple.private.ids",
     "com.apple.private.alloy.fmf",
@@ -70,47 +67,26 @@ def register_state(config_dir: Path, *, debug_redacted: bool = False) -> dict[st
     )
     write_secret_section(config_dir, "people", people)
 
-    helper = _helper_path()
-    request = {
-        "account": account,
-        "debug_redacted": debug_redacted,
-        "device": {
-            "display_name": device.display_name,
-            "os_version": device.os_version,
-            "product_type": device.product_type,
-            "udid": device.udid,
-        },
-        "existing_people_state": people,
-    }
-    response = _run_helper(helper, request)
-    exported_people = _dict_value(response.get("people"))
-    if not _registered(exported_people):
-        raise AppleRegistrationError(
-            "helper did not return APNs courier token and IDS registration state",
+    try:
+        ids_result = register_ids(
+            account_state=account,
+            anisette_headers=_anisette_headers(config_dir, account),
+            apns_state=_dict_value(people.get("apns")),
+            device=device,
+            existing=_dict_value(people.get("ids")),
         )
+    except IDSRegistrationError as exc:
+        raise AppleRegistrationError(str(exc)) from exc
 
-    merged_people = _merge_dicts(people, exported_people)
-    write_secret_section(config_dir, "people", merged_people)
-    sanitized_account = _dict_value(response.get("account"))
-    if sanitized_account:
-        write_secret_section(config_dir, "account", sanitized_account)
+    people["ids"] = ids_result.ids_state
+    write_secret_section(config_dir, "people", people)
+    write_secret_section(config_dir, "account", ids_result.account_state)
 
     return {
         "status": "registered",
         "device_display_name": device.display_name,
         "device_profile": device.product_type,
     }
-
-
-def _helper_path() -> str:
-    configured = os.environ.get(APPLE_HELPER_ENV)
-    helper = configured or APPLE_HELPER_DEFAULT
-    path = shutil.which(helper) if os.path.basename(helper) == helper else helper
-    if path is None:
-        raise AppleRegistrationError(
-            f"`{helper}` is required for APNs/IDS registration",
-        )
-    return path
 
 
 async def _register_apns(device: Any, existing: dict[str, Any]) -> dict[str, Any]:
@@ -167,7 +143,7 @@ async def _register_apns(device: Any, existing: dict[str, Any]) -> dict[str, Any
         private_key,
         token=token,
     ) as conn:
-        base_token = await conn.base_token
+        base_token = await _maybe_await(conn.base_token)
         scoped_tokens = dict(scoped)
         for topic in APNS_TOPICS:
             if topic not in scoped_tokens:
@@ -182,36 +158,25 @@ async def _register_apns(device: Any, existing: dict[str, Any]) -> dict[str, Any
     }
 
 
-def _run_helper(helper: str, request: dict[str, Any]) -> dict[str, Any]:
-    encoded = json.dumps(request, separators=(",", ":"), sort_keys=True).encode()
-    try:
-        result = subprocess.run(
-            [helper, "register"],
-            input=encoded,
-            check=True,
-            capture_output=True,
-        )
-    except OSError as exc:
-        raise AppleRegistrationError("failed to run APNs/IDS helper") from exc
-    except subprocess.CalledProcessError as exc:
-        detail = exc.stderr.decode("utf-8", errors="replace").strip()
-        msg = "APNs/IDS helper failed"
-        if detail:
-            msg = f"{msg}: {detail}"
-        raise AppleRegistrationError(msg) from exc
+def _anisette_headers(
+    config_dir: Path,
+    account_state: dict[str, Any],
+) -> dict[str, str]:
+    from findmy import AppleAccount
 
+    account = AppleAccount.from_json(
+        account_state,
+        anisette_libs_path=_anisette_libs_path(config_dir),
+    )
     try:
-        decoded = json.loads(result.stdout.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise AppleRegistrationError("APNs/IDS helper returned malformed JSON") from exc
-    if not isinstance(decoded, dict):
-        raise AppleRegistrationError("APNs/IDS helper returned non-object JSON")
-    return decoded
+        return dict(account.get_anisette_headers(with_client_info=False))
+    finally:
+        _close_account(account)
 
 
 def _registered(people: dict[str, Any]) -> bool:
     return bool(_dict_path(people, "apns").get("courier_token")) and bool(
-        _dict_path(people, "ids"),
+        _dict_path(people, "ids").get("registered"),
     )
 
 
@@ -239,6 +204,12 @@ def _bytes_from_hex(value: str | None) -> bytes | None:
         return bytes.fromhex(value)
     except ValueError as exc:
         raise AppleRegistrationError("stored APNs token is malformed") from exc
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 def _macos_build_for_version(version: str) -> str:

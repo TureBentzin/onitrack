@@ -68,6 +68,26 @@ def test_people_location_get_rejects_two_output_modes(capsys):
     assert "choose only one of --anonomyse or --plain" in error
 
 
+def test_people_key_import_requires_anonymized_mode(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "people",
+                "key",
+                "import",
+                "--person-id",
+                "a" * 64,
+                "--advertised-id",
+                "advertised",
+            ],
+        )
+
+    assert exc.value.code == 2
+    error = capsys.readouterr().err
+    assert "usage: onitrack people key import" in error
+    assert "choose --anonomyse" in error
+
+
 def test_people_requires_subcommand_uses_people_usage(capsys):
     with pytest.raises(SystemExit) as exc:
         main(["people"])
@@ -75,7 +95,7 @@ def test_people_requires_subcommand_uses_people_usage(capsys):
     assert exc.value.code == 2
     error = capsys.readouterr().err
     assert "usage: onitrack people" in error
-    assert "{list,alias,location}" in error
+    assert "{list,alias,key,location}" in error
     assert "people requires a subcommand" in error
 
 

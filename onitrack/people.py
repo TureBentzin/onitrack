@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -229,6 +230,77 @@ def _store_people_alias(config_dir: Path, *, alias: str, person_id: str) -> int:
         ),
     )
     return 0
+
+
+def import_people_key(
+    config_dir: Path,
+    *,
+    person_id: str,
+    advertised_id: str,
+    private_key_blob_base64: str | None = None,
+) -> int:
+    if not _looks_like_hmac_id(person_id):
+        print("people: key_error: PERSON_ID must be an anonymized people list id")
+        return 1
+    if not advertised_id or advertised_id.strip() != advertised_id:
+        print("people: key_error: advertised id must be non-empty without spaces")
+        return 1
+
+    encoded = private_key_blob_base64
+    if encoded is None:
+        encoded = sys.stdin.read()
+    encoded = "".join(encoded.split())
+    if not encoded:
+        print("people: key_error: private key blob is required on stdin")
+        return 1
+
+    try:
+        private_key_blob = base64.b64decode(encoded, validate=True)
+        parse_people_private_key_blob(private_key_blob)
+    except (binascii.Error, ValueError, PeopleLocationError) as exc:
+        print(f"people: key_error: {exc}")
+        return 1
+
+    try:
+        migrate_legacy_secrets(config_dir)
+        _store_people_key(
+            config_dir,
+            person_id=person_id,
+            advertised_id=advertised_id,
+            private_key_blob=private_key_blob,
+        )
+    except SecretStoreError as exc:
+        print(f"people: secret_store_error: {exc}")
+        return 1
+
+    print(
+        json.dumps(
+            {
+                "person_id": person_id,
+                "advertised_id_digest": anonymize_value(config_dir, advertised_id),
+                "key_status": "ready",
+            },
+            sort_keys=True,
+        ),
+    )
+    return 0
+
+
+def _store_people_key(
+    config_dir: Path,
+    *,
+    person_id: str,
+    advertised_id: str,
+    private_key_blob: bytes,
+) -> None:
+    state = load_people_state(config_dir)
+    keys = _dict_value(state.get("keys"))
+    keys[person_id] = {
+        "advertised_id": advertised_id,
+        "private_key": base64.b64encode(private_key_blob).decode("ascii"),
+    }
+    state["keys"] = keys
+    write_people_state(config_dir, state)
 
 
 def get_people_location(

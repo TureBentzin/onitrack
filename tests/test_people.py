@@ -1,4 +1,5 @@
 import base64
+import io
 import json
 import os
 from datetime import UTC, datetime
@@ -18,6 +19,7 @@ from onitrack.people import (
     decrypt_searchparty_location,
     default_display_name,
     load_or_create_device_identity,
+    load_people_key,
     parse_following,
     parse_location_plaintext,
     parse_people_private_key_blob,
@@ -224,6 +226,81 @@ def test_people_alias_setup_interactively_stores_alias(
     assert "two@example.com" in output
     assert "fm-one" not in output
     assert "fm-two" not in output
+
+
+def test_people_key_import_validates_and_stores_only_encrypted_secret(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    private_key_blob = _valid_p224_private_key_blob()
+    encoded_key = base64.b64encode(private_key_blob).decode("ascii")
+    person_id = "a" * 64
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(encoded_key))
+
+    assert (
+        main(
+            [
+                "people",
+                "--config-dir",
+                os.fspath(tmp_path),
+                "key",
+                "import",
+                "--person-id",
+                person_id,
+                "--advertised-id",
+                "advertised-raw",
+                "--anonomyse",
+            ],
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    state = read_json(people_config_path(tmp_path))
+    secrets = read_secrets(tmp_path)
+    stored = load_people_key(secrets["people"], person_id)
+
+    assert state == {}
+    assert stored is not None
+    assert stored.advertised_id == "advertised-raw"
+    assert stored.private_key_blob == private_key_blob
+    assert "advertised-raw" not in output
+    assert encoded_key not in output
+    assert "advertised-raw" not in people_config_path(tmp_path).read_text(
+        encoding="utf-8",
+    )
+    assert encoded_key not in people_config_path(tmp_path).read_text(encoding="utf-8")
+
+
+def test_people_key_import_rejects_invalid_key_without_storing(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    monkeypatch.setattr("sys.stdin", io.StringIO("not-base64"))
+
+    assert (
+        main(
+            [
+                "people",
+                "--config-dir",
+                os.fspath(tmp_path),
+                "key",
+                "import",
+                "--person-id",
+                "a" * 64,
+                "--advertised-id",
+                "advertised-raw",
+                "--anonomyse",
+            ],
+        )
+        == 1
+    )
+
+    assert "people: key_error:" in capsys.readouterr().out
+    assert read_secrets(tmp_path) == {}
 
 
 def test_people_location_prints_anonymized_mode(monkeypatch, tmp_path, capsys):
@@ -616,3 +693,18 @@ def test_default_display_name_uses_hostname_and_falls_back_to_onitrack(monkeypat
 
     monkeypatch.setattr("socket.gethostname", lambda: "")
     assert default_display_name() == "onitrack"
+
+
+def _valid_p224_private_key_blob() -> bytes:
+    cryptography = pytest.importorskip("cryptography")
+    assert cryptography is not None
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    private_key = ec.generate_private_key(ec.SECP224R1())
+    scalar = private_key.private_numbers().private_value.to_bytes(28, "big")
+    public = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.X962,
+        format=serialization.PublicFormat.UncompressedPoint,
+    )
+    return public + scalar

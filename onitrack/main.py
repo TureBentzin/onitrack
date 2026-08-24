@@ -105,6 +105,24 @@ def build_parser() -> argparse.ArgumentParser:
         "setup",
         help="interactively bind an alias to an accepted relationship",
     )
+    people_key_parser = people_subparsers.add_parser(
+        "key",
+        help="manage People location keys",
+    )
+    people_key_subparsers = people_key_parser.add_subparsers(
+        dest="people_key_command",
+    )
+    people_key_import_parser = people_key_subparsers.add_parser(
+        "import",
+        help="import a validated People location key from stdin",
+    )
+    people_key_import_parser.add_argument("--person-id", required=True)
+    people_key_import_parser.add_argument("--advertised-id", required=True)
+    people_key_import_parser.add_argument(
+        "--anonomyse",
+        action="store_true",
+        help="print anonymized key diagnostics",
+    )
     people_location_parser = people_subparsers.add_parser(
         "location",
         help="fetch configured People locations",
@@ -137,6 +155,8 @@ def build_parser() -> argparse.ArgumentParser:
     people_alias_parser.set_defaults(_command_parser=people_alias_parser)
     people_alias_set_parser.set_defaults(_command_parser=people_alias_set_parser)
     people_alias_setup_parser.set_defaults(_command_parser=people_alias_setup_parser)
+    people_key_parser.set_defaults(_command_parser=people_key_parser)
+    people_key_import_parser.set_defaults(_command_parser=people_key_import_parser)
     people_location_parser.set_defaults(_command_parser=people_location_parser)
     people_location_get_parser.set_defaults(_command_parser=people_location_get_parser)
 
@@ -180,6 +200,7 @@ def main(argv: list[str] | None = None) -> int:
         case "people":
             from onitrack.people import (
                 get_people_location,
+                import_people_key,
                 list_people,
                 set_people_alias,
                 setup_people_alias,
@@ -212,6 +233,20 @@ def main(argv: list[str] | None = None) -> int:
                         case None:
                             args._command_parser.error(
                                 "people alias requires a subcommand",
+                            )
+                case "key":
+                    match args.people_key_command:
+                        case "import":
+                            if not args.anonomyse:
+                                args._command_parser.error("choose --anonomyse")
+                            return import_people_key(
+                                resolve_config_dir(args.config_dir),
+                                person_id=args.person_id,
+                                advertised_id=args.advertised_id,
+                            )
+                        case None:
+                            args._command_parser.error(
+                                "people key requires a subcommand",
                             )
                 case "location":
                     match args.people_location_command:

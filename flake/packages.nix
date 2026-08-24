@@ -141,6 +141,13 @@ let
       "bleak"
     ];
 
+    postPatch = ''
+      substituteInPlace findmy/reports/account.py \
+        --replace-fail \
+          '{"dsid": data["dsid"], "mobileme_data": mobileme_data["service-data"]},' \
+          '{"dsid": data["dsid"], "mobileme_data": mobileme_data["service-data"], "idms_pet": self._login_state_data["idms_pet"], "adsid": self._login_state_data["adsid"]},'
+    '';
+
     pythonImportsCheck = [
       "findmy"
     ];

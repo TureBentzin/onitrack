@@ -7,52 +7,33 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from onitrack.apple import _register_apns, register_state
+from onitrack.ids import IDSRegistrationError, IDSRegistrationResult
 from onitrack.main import main
 from onitrack.state import read_secrets, write_secret_section
 
 
-def test_apple_register_invokes_helper_and_persists_scoped_state(
+def test_apple_register_persists_native_ids_state(
     monkeypatch,
     tmp_path,
     capsys,
 ):
-    helper = tmp_path / "onitrack-apple-helper"
-    request_path = tmp_path / "helper-request.json"
-    helper.write_text(
-        f"""#!{sys.executable}
-import json
-import pathlib
-import sys
+    captured = {}
 
-request = json.loads(sys.stdin.read())
-pathlib.Path({os.fspath(request_path)!r}).write_text(
-    json.dumps(request, sort_keys=True),
-    encoding="utf-8",
-)
-json.dump(
-    {{
-        "account": {{
-            "account": {{"username": request["account"]["account"]["username"]}},
-            "login": {{"state": 3, "data": {{"dsid": "123"}}}},
-        }},
-        "people": {{
-            "apns": {{"courier_token": "apns-token"}},
-            "ids": {{"registration": "ids-state"}},
-            "keys": {{
-                "person-id": {{
-                    "advertised_id": "advertised",
-                    "private_key": "cHJpdmF0ZQ==",
-                }}
-            }},
-        }},
-    }},
-    sys.stdout,
-)
-""",
-        encoding="utf-8",
-    )
-    helper.chmod(0o755)
-    monkeypatch.setenv("ONITRACK_APPLE_HELPER", os.fspath(helper))
+    def fake_register_ids(**kwargs):
+        captured.update(kwargs)
+        return IDSRegistrationResult(
+            ids_state={
+                "registered": True,
+                "service": "com.apple.private.alloy.multiplex1",
+            },
+            account_state={
+                "account": {"username": "person@example.com"},
+                "login": {"state": 3, "data": {"dsid": "123"}},
+            },
+        )
+
+    monkeypatch.setattr("onitrack.apple._anisette_headers", lambda *args: {"h": "v"})
+    monkeypatch.setattr("onitrack.apple.register_ids", fake_register_ids)
     write_secret_section(
         tmp_path,
         "account",
@@ -82,25 +63,27 @@ json.dump(
     result = register_state(tmp_path, debug_redacted=True)
 
     secrets = read_secrets(tmp_path)
-    helper_request = json.loads(request_path.read_text(encoding="utf-8"))
     assert result["status"] == "registered"
-    assert helper_request["debug_redacted"] is True
-    assert helper_request["device"]["display_name"].startswith("onitrack")
-    assert helper_request["account"]["login"]["data"]["idms_pet"] == "transient-pet"
-    assert secrets["people"]["apns"]["courier_token"] == "apns-token"
-    assert secrets["people"]["ids"]["registration"] == "ids-state"
-    assert secrets["people"]["keys"]["person-id"]["advertised_id"] == "advertised"
+    assert captured["anisette_headers"] == {"h": "v"}
+    assert captured["account_state"]["login"]["data"]["idms_pet"] == "transient-pet"
+    assert captured["apns_state"]["courier_token"] == "00"
+    assert secrets["people"]["ids"]["registered"] is True
     assert "idms_pet" not in json.dumps(secrets["account"])
-    assert "apns-token" not in (tmp_path / "secrets.age").read_text(encoding="utf-8")
     assert capsys.readouterr().out == ""
 
 
-def test_apple_register_missing_helper_returns_clear_error(
+def test_apple_register_ids_error_returns_clear_error(
     monkeypatch,
     tmp_path,
     capsys,
 ):
-    monkeypatch.setenv("ONITRACK_APPLE_HELPER", "missing-onitrack-apple-helper")
+    monkeypatch.setattr("onitrack.apple._anisette_headers", lambda *args: {})
+    monkeypatch.setattr(
+        "onitrack.apple.register_ids",
+        lambda **kwargs: (_ for _ in ()).throw(
+            IDSRegistrationError("saved auth lacks delegate-capable IDMS PET"),
+        ),
+    )
     write_secret_section(
         tmp_path,
         "account",
@@ -128,7 +111,7 @@ def test_apple_register_missing_helper_returns_clear_error(
 
     output = capsys.readouterr().out
     assert "apple: registration_error:" in output
-    assert "missing-onitrack-apple-helper" in output
+    assert "delegate-capable IDMS PET" in output
 
 
 def test_register_apns_activates_and_mints_scoped_tokens(monkeypatch):
