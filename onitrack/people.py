@@ -5,9 +5,12 @@ import hashlib
 import hmac
 import json
 import os
+import plistlib
+import sys
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib import error, request
@@ -17,6 +20,7 @@ from onitrack.state import (
     CONFIG_FILE_MODE,
     account_config_path,
     device_config_path,
+    people_config_path,
     privacy_config_path,
     read_json,
     write_json_atomic,
@@ -30,6 +34,11 @@ DEFAULT_DISPLAY_NAME = "Onitrack"
 APPLE_PRODUCT_TYPE = "MacBookPro18,3"
 APPLE_OS_VERSION = "14.6"
 FINDMYLOCATED_BUNDLE = "com.apple.findmy.findmylocated"
+SEARCHPARTY_ENDPOINT = "https://gateway.icloud.com/findmyservice/fetch"
+APPLE_EPOCH = datetime(2001, 1, 1, tzinfo=UTC)
+P224_PUBLIC_KEY_BYTES = 57
+P224_SCALAR_BYTES = 28
+P224_PRIVATE_BLOB_BYTES = P224_PUBLIC_KEY_BYTES + P224_SCALAR_BYTES
 
 
 class PeopleProvisioningError(RuntimeError):
@@ -40,6 +49,10 @@ class PeopleProtocolError(RuntimeError):
     def __init__(self, message: str, *, status: int | None = None) -> None:
         super().__init__(message)
         self.status = status
+
+
+class PeopleLocationError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -56,6 +69,34 @@ class DeviceIdentity:
     display_name: str
     product_type: str = APPLE_PRODUCT_TYPE
     os_version: str = APPLE_OS_VERSION
+
+
+@dataclass(frozen=True)
+class PeopleKey:
+    person_id: str
+    advertised_id: str
+    private_key_blob: bytes
+
+
+@dataclass(frozen=True)
+class SearchPartyReport:
+    advertised_id: str
+    ciphertext: bytes
+    location_ts: float | int | None
+
+
+@dataclass(frozen=True)
+class LocationFix:
+    alias: str
+    person_id: str
+    fm_id: str
+    advertised_id: str
+    latitude: float
+    longitude: float
+    horizontal_accuracy_m: float | None
+    source_timestamp: datetime | None
+    received_timestamp: datetime
+    key_status: str = "ready"
 
 
 def list_people(config_dir: Path, *, anonymise: bool) -> int:
@@ -78,9 +119,134 @@ def list_people(config_dir: Path, *, anonymise: bool) -> int:
     return 0
 
 
+def set_people_alias(config_dir: Path, *, alias: str, person_id: str) -> int:
+    if not alias or alias.strip() != alias:
+        print("people: alias_error: alias must be non-empty without surrounding spaces")
+        return 1
+    if not _looks_like_hmac_id(person_id):
+        print("people: alias_error: PERSON_ID must be an anonymized people list id")
+        return 1
+
+    try:
+        relationships = PeopleClient(config_dir).list_relationships()
+    except PeopleProvisioningError as exc:
+        print(f"people: provisioning_error: {exc}")
+        return 1
+    except PeopleProtocolError as exc:
+        status = "unknown" if exc.status is None else str(exc.status)
+        print(f"people: protocol_error: status={status} category={exc}")
+        return 1
+
+    known_ids = {
+        item["person_id"]
+        for item in anonymized_relationships(config_dir, relationships)
+    }
+    if person_id not in known_ids:
+        print("people: alias_error: PERSON_ID was not found in accepted relationships")
+        return 1
+
+    return _store_people_alias(config_dir, alias=alias, person_id=person_id)
+
+
+def setup_people_alias(config_dir: Path) -> int:
+    try:
+        relationships = PeopleClient(config_dir).list_relationships()
+    except PeopleProvisioningError as exc:
+        print(f"people: provisioning_error: {exc}")
+        return 1
+    except PeopleProtocolError as exc:
+        status = "unknown" if exc.status is None else str(exc.status)
+        print(f"people: protocol_error: status={status} category={exc}")
+        return 1
+
+    anonymized = anonymized_relationships(config_dir, relationships)
+    if not anonymized:
+        print("people: alias_error: no accepted relationships found")
+        return 1
+
+    for index, (raw, anonymized_row) in enumerate(
+        zip(relationships, anonymized, strict=True),
+        start=1,
+    ):
+        handles = ", ".join(raw.accepted_handles) if raw.accepted_handles else "(none)"
+        print(
+            f"{index}. handles={handles} "
+            f"person_id={anonymized_row['person_id']} "
+            f"secure_locations_capable={anonymized_row['secure_locations_capable']}",
+        )
+
+    selected = input("Select relationship number: ").strip()
+    try:
+        selected_index = int(selected)
+    except ValueError:
+        print("people: alias_error: selection must be a number")
+        return 1
+    if selected_index < 1 or selected_index > len(anonymized):
+        print("people: alias_error: selection is out of range")
+        return 1
+
+    alias = input("Alias label: ").strip()
+    if not alias:
+        print("people: alias_error: alias must be non-empty")
+        return 1
+
+    return _store_people_alias(
+        config_dir,
+        alias=alias,
+        person_id=anonymized[selected_index - 1]["person_id"],
+    )
+
+
+def _store_people_alias(config_dir: Path, *, alias: str, person_id: str) -> int:
+    state = load_people_state(config_dir)
+    aliases = _dict_value(state.get("aliases"))
+    aliases[alias] = {"person_id": person_id}
+    state["aliases"] = aliases
+    write_people_state(config_dir, state)
+    print(
+        json.dumps(
+            {"alias_id": anonymize_value(config_dir, alias), "person_id": person_id},
+            sort_keys=True,
+        ),
+    )
+    return 0
+
+
+def get_people_location(
+    config_dir: Path,
+    *,
+    alias: str,
+    anonymise: bool,
+    debug_redacted: bool = False,
+) -> int:
+    logger = DebugLogger(config_dir, enabled=debug_redacted)
+    try:
+        fix = PeopleClient(config_dir, debug_logger=logger).get_location(alias)
+        payload = (
+            anonymized_location(config_dir, fix)
+            if anonymise
+            else plain_location(fix)
+        )
+    except (PeopleProvisioningError, PeopleLocationError) as exc:
+        print(f"people: provisioning_error: {exc}")
+        return 1
+    except PeopleProtocolError as exc:
+        status = "unknown" if exc.status is None else str(exc.status)
+        print(f"people: protocol_error: status={status} category={exc}")
+        return 1
+
+    print(json.dumps({"locations": [payload]}, indent=2, sort_keys=True))
+    return 0
+
+
 class PeopleClient:
-    def __init__(self, config_dir: Path) -> None:
+    def __init__(
+        self,
+        config_dir: Path,
+        debug_logger: DebugLogger | None = None,
+    ) -> None:
         self.config_dir = config_dir
+        self.debug_logger = debug_logger or DebugLogger(config_dir, enabled=False)
 
     def list_relationships(self) -> list[PersonRelationship]:
         account = self._load_logged_in_account()
@@ -89,6 +255,76 @@ class PeopleClient:
             device = load_or_create_device_identity(self.config_dir)
             response = self._init_client(account, state, device)
             return parse_following(response)
+        finally:
+            _close_account(account)
+
+    def get_location(self, alias: str) -> LocationFix:
+        people_state = load_people_state(self.config_dir)
+        alias_config = _dict_value(_dict_value(people_state.get("aliases")).get(alias))
+        person_id = _string_value(alias_config.get("person_id"))
+        if person_id is None:
+            raise PeopleLocationError("alias is not configured")
+
+        account = self._load_logged_in_account()
+        try:
+            state = account.to_json()
+            device = load_or_create_device_identity(self.config_dir)
+            response = self._init_client(account, state, device)
+            relationship = relationship_for_person_id(
+                self.config_dir,
+                parse_following(response),
+                person_id,
+            )
+            if relationship is None:
+                raise PeopleLocationError(
+                    "configured alias no longer matches an accepted relationship",
+                )
+
+            key = load_people_key(people_state, person_id)
+            if key is None:
+                self.debug_logger.emit(
+                    "people_key_missing",
+                    {
+                        "alias": alias,
+                        "person_id": person_id,
+                        "fmId": relationship.fm_id,
+                    },
+                )
+                raise PeopleLocationError(
+                    "People location key is pending; APNs/IDS provisioning is required",
+                )
+
+            apns_token = _string_value(
+                _dict_path(people_state, "apns").get("courier_token"),
+            )
+            if apns_token is None:
+                raise PeopleLocationError("APNs courier token is missing")
+
+            searchparty = self._fetch_searchparty(
+                account,
+                state,
+                device,
+                relationship.fm_id,
+                key.advertised_id,
+                apns_token,
+            )
+            report = select_searchparty_report(searchparty, key.advertised_id)
+            if report is None:
+                raise PeopleLocationError("no SearchParty report for configured alias")
+            private_key = parse_people_private_key_blob(key.private_key_blob)
+            plaintext = decrypt_searchparty_location(report.ciphertext, private_key)
+            decoded = parse_location_plaintext(plaintext, report.location_ts)
+            return LocationFix(
+                alias=alias,
+                person_id=person_id,
+                fm_id=relationship.fm_id,
+                advertised_id=key.advertised_id,
+                latitude=decoded["latitude"],
+                longitude=decoded["longitude"],
+                horizontal_accuracy_m=decoded.get("horizontal_accuracy_m"),
+                source_timestamp=decoded.get("source_timestamp"),
+                received_timestamp=datetime.now(UTC),
+            )
         finally:
             _close_account(account)
 
@@ -168,7 +404,7 @@ class PeopleClient:
                 "prsId": dsid,
             },
         }
-        return _post_json(
+        response = _post_json(
             FMF_ENDPOINT_TEMPLATE.format(
                 host=host,
                 dsid=dsid,
@@ -178,6 +414,89 @@ class PeopleClient:
             auth=(dsid, token),
             body=body,
         )
+        self.debug_logger.emit(
+            "fmf_init_client",
+            {
+                "status": 200,
+                "dsid": dsid,
+                "fmf_host": host,
+                "response_keys": sorted(response),
+                "following_count": len(response.get("following", []))
+                if isinstance(response.get("following"), list)
+                else 0,
+            },
+        )
+        return response
+
+    def _fetch_searchparty(
+        self,
+        account: Any,
+        state: dict[str, Any],
+        device: DeviceIdentity,
+        fm_id: str,
+        advertised_id: str,
+        apns_token: str,
+    ) -> dict[str, Any]:
+        login_data = _dict_path(state, "login", "data")
+        dsid = _string_value(login_data.get("dsid"))
+        if dsid is None:
+            raise PeopleProvisioningError("saved account is missing DSID")
+        token = _find_first_string(
+            _dict_path(login_data, "mobileme_data"),
+            ("searchPartyToken", "mmeSearchPartyToken", "searchpartyToken"),
+        )
+        if token is None:
+            raise PeopleProvisioningError(
+                "saved account is missing a SearchParty token",
+            )
+
+        headers = dict(account.get_anisette_headers(with_client_info=True))
+        headers.update(
+            {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "findmylocated/1 CFNetwork/1496.0.7 Darwin/23.5.0",
+            },
+        )
+        body = {
+            "fetch": [
+                {
+                    "fmId": fm_id,
+                    "intent": "startLocationUpdates",
+                    "mode": "shallow",
+                    "ids": [advertised_id],
+                },
+            ],
+            "clientContext": {
+                "apsToken": apns_token,
+                "clientId": device.udid,
+                "contextApp": FINDMYLOCATED_BUNDLE,
+                "shallowStats": {},
+                "liveStats": {},
+                "nearbyWatchIdentifiers": [],
+            },
+        }
+        response = _post_json(
+            SEARCHPARTY_ENDPOINT,
+            headers=headers,
+            auth=(dsid, token),
+            body=body,
+        )
+        payload = response.get("locationPayload", [])
+        self.debug_logger.emit(
+            "searchparty_fetch",
+            {
+                "status": 200,
+                "dsid": dsid,
+                "fmId": fm_id,
+                "advertised_id": advertised_id,
+                "response_keys": sorted(response),
+                "location_payload_count": len(payload)
+                if isinstance(payload, list)
+                else 0,
+            },
+        )
+        return response
 
 
 def parse_following(response: dict[str, Any]) -> list[PersonRelationship]:
@@ -245,6 +564,341 @@ def plain_relationships(
         }
         for relationship in relationships
     ]
+
+
+def anonymized_location(config_dir: Path, fix: LocationFix) -> dict[str, Any]:
+    source_age_seconds = None
+    if fix.source_timestamp is not None:
+        source_age_seconds = max(
+            0,
+            int((fix.received_timestamp - fix.source_timestamp).total_seconds()),
+        )
+    return {
+        "alias_id": anonymize_value(config_dir, fix.alias),
+        "person_id": fix.person_id,
+        "status": "location_available",
+        "location_available": True,
+        "source_age_seconds": source_age_seconds,
+        "horizontal_accuracy_m": fix.horizontal_accuracy_m,
+        "position_digest": anonymize_value(
+            config_dir,
+            _coordinate_digest_input(fix.latitude, fix.longitude),
+        ),
+        "report_digest": anonymize_value(
+            config_dir,
+            "|".join(
+                [
+                    _coordinate_digest_input(fix.latitude, fix.longitude),
+                    fix.source_timestamp.isoformat()
+                    if fix.source_timestamp is not None
+                    else "",
+                    ""
+                    if fix.horizontal_accuracy_m is None
+                    else str(fix.horizontal_accuracy_m),
+                ],
+            ),
+        ),
+        "key_status": fix.key_status,
+    }
+
+
+def plain_location(fix: LocationFix) -> dict[str, Any]:
+    return {
+        "alias": fix.alias,
+        "person_id": fix.person_id,
+        "fm_id": fix.fm_id,
+        "advertised_id": fix.advertised_id,
+        "status": "location_available",
+        "location_available": True,
+        "latitude": fix.latitude,
+        "longitude": fix.longitude,
+        "horizontal_accuracy_m": fix.horizontal_accuracy_m,
+        "source_timestamp": fix.source_timestamp.isoformat()
+        if fix.source_timestamp is not None
+        else None,
+        "received_timestamp": fix.received_timestamp.isoformat(),
+        "key_status": fix.key_status,
+    }
+
+
+def relationship_for_person_id(
+    config_dir: Path,
+    relationships: list[PersonRelationship],
+    person_id: str,
+) -> PersonRelationship | None:
+    salt = load_or_create_privacy_salt(config_dir)
+    for relationship in relationships:
+        if _hmac_hex(salt, relationship.fm_id) == person_id:
+            return relationship
+    return None
+
+
+def load_people_state(config_dir: Path) -> dict[str, Any]:
+    return read_json(people_config_path(config_dir)) or {}
+
+
+def write_people_state(config_dir: Path, state: dict[str, Any]) -> None:
+    path = people_config_path(config_dir)
+    write_json_atomic(path, state)
+    path.chmod(CONFIG_FILE_MODE)
+
+
+def load_people_key(state: dict[str, Any], person_id: str) -> PeopleKey | None:
+    key_state = _dict_value(_dict_value(state.get("keys")).get(person_id))
+    advertised_id = _string_value(key_state.get("advertised_id"))
+    encoded_key = _string_value(key_state.get("private_key"))
+    if advertised_id is None or encoded_key is None:
+        return None
+    try:
+        private_key_blob = base64.b64decode(encoded_key, validate=True)
+    except ValueError:
+        raise PeopleLocationError("stored People location key is malformed") from None
+    return PeopleKey(
+        person_id=person_id,
+        advertised_id=advertised_id,
+        private_key_blob=private_key_blob,
+    )
+
+
+def select_searchparty_report(
+    response: dict[str, Any],
+    advertised_id: str,
+) -> SearchPartyReport | None:
+    candidates: list[SearchPartyReport] = []
+    payloads = response.get("locationPayload", [])
+    if not isinstance(payloads, list):
+        return None
+
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        if _string_value(payload.get("id")) != advertised_id:
+            continue
+        infos = payload.get("locationInfo", [])
+        if not isinstance(infos, list):
+            continue
+        for info in infos:
+            if not isinstance(info, dict):
+                continue
+            encoded_location = _string_value(info.get("location"))
+            if encoded_location is None:
+                continue
+            try:
+                ciphertext = base64.b64decode(encoded_location, validate=True)
+            except ValueError:
+                continue
+            if len(ciphertext) <= P224_PUBLIC_KEY_BYTES:
+                continue
+            location_ts = _number_value(info.get("locationTs"))
+            candidates.append(
+                SearchPartyReport(
+                    advertised_id=advertised_id,
+                    ciphertext=ciphertext,
+                    location_ts=location_ts,
+                ),
+            )
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda report: report.location_ts or 0)
+
+
+def parse_people_private_key_blob(blob: bytes) -> Any:
+    if len(blob) != P224_PRIVATE_BLOB_BYTES:
+        raise PeopleLocationError("stored People location key has invalid length")
+
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    public_bytes = blob[:P224_PUBLIC_KEY_BYTES]
+    scalar = int.from_bytes(blob[P224_PUBLIC_KEY_BYTES:], "big")
+    if scalar <= 0:
+        raise PeopleLocationError("stored People location key has invalid scalar")
+
+    try:
+        from cryptography.hazmat.primitives import serialization
+
+        private_key = ec.derive_private_key(scalar, ec.SECP224R1())
+        derived_public = private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.X962,
+            format=serialization.PublicFormat.UncompressedPoint,
+        )
+    except ValueError as exc:
+        raise PeopleLocationError("stored People location key is invalid") from exc
+
+    if not hmac.compare_digest(public_bytes, derived_public):
+        raise PeopleLocationError("stored People location key public point mismatch")
+    return private_key
+
+
+def decrypt_searchparty_location(ciphertext: bytes, private_key: Any) -> bytes:
+    if len(ciphertext) <= P224_PUBLIC_KEY_BYTES:
+        raise PeopleLocationError("SearchParty location ciphertext is too short")
+
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    ephemeral_bytes = ciphertext[:P224_PUBLIC_KEY_BYTES]
+    payload = ciphertext[P224_PUBLIC_KEY_BYTES:]
+    try:
+        ephemeral = ec.EllipticCurvePublicKey.from_encoded_point(
+            ec.SECP224R1(),
+            ephemeral_bytes,
+        )
+        secret = private_key.exchange(ec.ECDH(), ephemeral)
+        material = x963_sha256(secret, 32, shared_info=ephemeral_bytes)
+        return AESGCM(material[:16]).decrypt(material[16:32], payload, None)
+    except ValueError as exc:
+        raise PeopleLocationError(
+            "SearchParty location could not be decrypted",
+        ) from exc
+
+
+def x963_sha256(secret: bytes, length: int, *, shared_info: bytes = b"") -> bytes:
+    output = b""
+    counter = 1
+    while len(output) < length:
+        output += hashlib.sha256(
+            secret + counter.to_bytes(4, "big") + shared_info,
+        ).digest()
+        counter += 1
+    return output[:length]
+
+
+def parse_location_plaintext(
+    plaintext: bytes,
+    outer_location_ts: float | int | None,
+) -> dict[str, Any]:
+    decoded: Any
+    try:
+        decoded = json.loads(plaintext.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        try:
+            decoded = plistlib.loads(plaintext)
+        except plistlib.InvalidFileException as exc:
+            raise PeopleLocationError(
+                "SearchParty location plaintext is malformed",
+            ) from exc
+
+    if not isinstance(decoded, dict):
+        raise PeopleLocationError("SearchParty location plaintext is malformed")
+
+    latitude = _first_number(decoded, ("latitude", "lat"))
+    longitude = _first_number(decoded, ("longitude", "lon", "lng"))
+    if latitude is None or longitude is None:
+        coordinate = _dict_value(decoded.get("coordinate") or decoded.get("location"))
+        latitude = _first_number(coordinate, ("latitude", "lat"))
+        longitude = _first_number(coordinate, ("longitude", "lon", "lng"))
+    if latitude is None or longitude is None:
+        raise PeopleLocationError(
+            "SearchParty location plaintext is missing coordinates",
+        )
+
+    accuracy = _first_number(
+        decoded,
+        ("horizontalAccuracy", "horizontal_accuracy", "accuracy"),
+    )
+    timestamp_value = _first_number(
+        decoded,
+        ("timestamp", "timeStamp", "locationTs", "locationTimestamp"),
+    )
+    if timestamp_value is None:
+        timestamp_value = outer_location_ts
+
+    return {
+        "latitude": float(latitude),
+        "longitude": float(longitude),
+        "horizontal_accuracy_m": None if accuracy is None else float(accuracy),
+        "source_timestamp": apple_timestamp(timestamp_value),
+    }
+
+
+def apple_timestamp(value: float | int | None) -> datetime | None:
+    if value is None:
+        return None
+    numeric = float(value)
+    if numeric > 10_000_000_000:
+        return datetime.fromtimestamp(numeric / 1000, tz=UTC)
+    if numeric > 1_000_000_000:
+        return datetime.fromtimestamp(numeric, tz=UTC)
+    return APPLE_EPOCH + timedelta(seconds=numeric)
+
+
+def anonymize_value(config_dir: Path, value: str) -> str:
+    return _hmac_hex(load_or_create_privacy_salt(config_dir), value)
+
+
+class DebugLogger:
+    def __init__(self, config_dir: Path, *, enabled: bool) -> None:
+        self.enabled = enabled
+        self.redactor = DebugRedactor(load_or_create_privacy_salt(config_dir))
+
+    def emit(self, step: str, fields: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        payload = {"step": step, **self.redactor.redact(fields)}
+        print(json.dumps(payload, sort_keys=True), file=sys.stderr)
+
+
+class DebugRedactor:
+    _sensitive_keys = {
+        "handle",
+        "handles",
+        "accepted_handles",
+        "fmId",
+        "fm_id",
+        "dsid",
+        "apsToken",
+        "apns_token",
+        "courier_token",
+        "push_token",
+        "sender",
+        "sender_handle",
+        "advertised_id",
+        "id",
+        "key_id",
+        "account_id",
+        "apple_id",
+        "profile_id",
+    }
+    _remove_keys = {
+        "authToken",
+        "authorization",
+        "password",
+        "private_key",
+        "raw_response",
+        "anisette_headers",
+        "latitude",
+        "longitude",
+        "coordinates",
+    }
+
+    def __init__(self, salt: bytes) -> None:
+        self.salt = salt
+
+    def redact(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            redacted = {}
+            for key, child in value.items():
+                if key in self._remove_keys or key.lower() in self._remove_keys:
+                    redacted[key] = "<redacted>"
+                elif key in self._sensitive_keys or key.lower() in self._sensitive_keys:
+                    redacted[f"{key}_hmac"] = self._hash_value(child)
+                else:
+                    redacted[key] = self.redact(child)
+            return redacted
+        if isinstance(value, list):
+            return [self.redact(item) for item in value]
+        return value
+
+    def _hash_value(self, value: Any) -> Any:
+        if isinstance(value, list):
+            return [self._hash_value(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: self._hash_value(child)
+                for key, child in sorted(value.items(), key=lambda item: item[0])
+            }
+        return _hmac_hex(self.salt, str(value))
 
 
 def load_or_create_privacy_salt(config_dir: Path) -> bytes:
@@ -340,6 +994,26 @@ def _dict_path(data: dict[str, Any], *keys: str) -> dict[str, Any]:
     return current if isinstance(current, dict) else {}
 
 
+def _dict_value(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _number_value(value: Any) -> float | int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return value
+    return None
+
+
+def _first_number(data: dict[str, Any], keys: tuple[str, ...]) -> float | int | None:
+    for key in keys:
+        value = _number_value(data.get(key))
+        if value is not None:
+            return value
+    return None
+
+
 def _find_first_string(data: Any, keys: tuple[str, ...]) -> str | None:
     if isinstance(data, dict):
         for key in keys:
@@ -374,6 +1048,14 @@ def _optional_bool(value: Any) -> bool | None:
 
 def _base64_text(value: str) -> str:
     return base64.b64encode(value.encode("utf-8")).decode("ascii")
+
+
+def _coordinate_digest_input(latitude: float, longitude: float) -> str:
+    return f"{latitude:.6f},{longitude:.6f}"
+
+
+def _looks_like_hmac_id(value: str) -> bool:
+    return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
 
 
 def _hmac_hex(salt: bytes, value: str) -> str:

@@ -11,6 +11,7 @@ CONFIG_FILE_MODE = 0o600
 ACCOUNT_CONFIG_FILE = "account.json"
 DEVICE_CONFIG_FILE = "device.json"
 PRIVACY_CONFIG_FILE = "privacy.json"
+PEOPLE_CONFIG_FILE = "people.json"
 
 
 def default_config_dir() -> Path:
@@ -40,6 +41,10 @@ def device_config_path(config_dir: Path) -> Path:
 
 def privacy_config_path(config_dir: Path) -> Path:
     return config_dir / PRIVACY_CONFIG_FILE
+
+
+def people_config_path(config_dir: Path) -> Path:
+    return config_dir / PEOPLE_CONFIG_FILE
 
 
 def read_json(path: Path) -> dict[str, Any] | None:

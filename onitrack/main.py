@@ -64,8 +64,57 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print raw relationship identifiers",
     )
+    people_alias_parser = people_subparsers.add_parser(
+        "alias",
+        help="manage configured People aliases",
+    )
+    people_alias_subparsers = people_alias_parser.add_subparsers(
+        dest="people_alias_command",
+    )
+    people_alias_set_parser = people_alias_subparsers.add_parser(
+        "set",
+        help="bind an alias to an anonymized person_id",
+    )
+    people_alias_set_parser.add_argument("alias")
+    people_alias_set_parser.add_argument("person_id", metavar="PERSON_ID")
+    people_alias_setup_parser = people_alias_subparsers.add_parser(
+        "setup",
+        help="interactively bind an alias to an accepted relationship",
+    )
+    people_location_parser = people_subparsers.add_parser(
+        "location",
+        help="fetch configured People locations",
+    )
+    people_location_subparsers = people_location_parser.add_subparsers(
+        dest="people_location_command",
+    )
+    people_location_get_parser = people_location_subparsers.add_parser(
+        "get",
+        help="fetch one configured alias location",
+    )
+    people_location_get_parser.add_argument("--alias", required=True)
+    people_location_get_parser.add_argument(
+        "--anonomyse",
+        action="store_true",
+        help="print anonymized location diagnostics",
+    )
+    people_location_get_parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="print raw location data",
+    )
+    people_location_get_parser.add_argument(
+        "--debug-redacted",
+        action="store_true",
+        help="print redacted protocol diagnostics to stderr",
+    )
     people_parser.set_defaults(_command_parser=people_parser)
     people_list_parser.set_defaults(_command_parser=people_list_parser)
+    people_alias_parser.set_defaults(_command_parser=people_alias_parser)
+    people_alias_set_parser.set_defaults(_command_parser=people_alias_set_parser)
+    people_alias_setup_parser.set_defaults(_command_parser=people_alias_setup_parser)
+    people_location_parser.set_defaults(_command_parser=people_location_parser)
+    people_location_get_parser.set_defaults(_command_parser=people_location_get_parser)
 
     return parser
 
@@ -92,7 +141,12 @@ def main(argv: list[str] | None = None) -> int:
                 case None:
                     args._command_parser.error("auth requires a subcommand")
         case "people":
-            from onitrack.people import list_people
+            from onitrack.people import (
+                get_people_location,
+                list_people,
+                set_people_alias,
+                setup_people_alias,
+            )
 
             match args.people_command:
                 case "list":
@@ -106,6 +160,43 @@ def main(argv: list[str] | None = None) -> int:
                         resolve_config_dir(args.config_dir),
                         anonymise=args.anonomyse,
                     )
+                case "alias":
+                    match args.people_alias_command:
+                        case "set":
+                            return set_people_alias(
+                                resolve_config_dir(args.config_dir),
+                                alias=args.alias,
+                                person_id=args.person_id,
+                            )
+                        case "setup":
+                            return setup_people_alias(
+                                resolve_config_dir(args.config_dir),
+                            )
+                        case None:
+                            args._command_parser.error(
+                                "people alias requires a subcommand",
+                            )
+                case "location":
+                    match args.people_location_command:
+                        case "get":
+                            if not args.anonomyse and not args.plain:
+                                args._command_parser.error(
+                                    "choose --anonomyse or --plain",
+                                )
+                            if args.anonomyse and args.plain:
+                                args._command_parser.error(
+                                    "choose only one of --anonomyse or --plain",
+                                )
+                            return get_people_location(
+                                resolve_config_dir(args.config_dir),
+                                alias=args.alias,
+                                anonymise=args.anonomyse,
+                                debug_redacted=args.debug_redacted,
+                            )
+                        case None:
+                            args._command_parser.error(
+                                "people location requires a subcommand",
+                            )
                 case None:
                     args._command_parser.error("people requires a subcommand")
         case None:
