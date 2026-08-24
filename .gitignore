@@ -1,6 +1,10 @@
 # Nix
 result
 .direnv/
+.state/
 
 # Documents folder
 documents/
+
+# pycaches
+**/__pycache__
