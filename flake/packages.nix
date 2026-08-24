@@ -160,6 +160,18 @@ let
     version = "2.0.0.dev20260314";
     pyproject = true;
 
+    legacySrc = pkgs.fetchFromGitHub {
+      owner = "JJTech0130";
+      repo = "pypush";
+      rev = "8220f3407c96c975d0dd699fd5ab41f56f372c47";
+      hash = "sha256-Pr1klMvZdZ/5c6CgL44Yod2SftL7t+1vHhaemNcmHpE=";
+    };
+
+    nacBinary = pkgs.fetchurl {
+      url = "https://github.com/JJTech0130/nacserver/raw/main/IMDAppleServices";
+      hash = "sha256-dMKo/oJqR48U9uF7NwmosxXowODjTj+6a5xO7i9FFuk=";
+    };
+
     src = pkgs.fetchFromGitHub {
       owner = "JJTech0130";
       repo = "pypush";
@@ -179,13 +191,29 @@ let
       h2
       httpx
       importlib-metadata
+      requests
       typing-extensions
+      unicorn
     ];
+
+    postPatch = ''
+      cp -R ${legacySrc}/pypush/emulated pypush/emulated
+      chmod -R u+w pypush/emulated
+      touch pypush/emulated/__init__.py
+    '';
+
+    postInstall = ''
+      install -Dm600 ${legacySrc}/pypush/emulated/data.plist \
+        $out/${python.sitePackages}/pypush/emulated/data.plist
+      install -Dm555 ${nacBinary} \
+        $out/${python.sitePackages}/pypush/emulated/IMDAppleServices
+    '';
 
     SETUPTOOLS_SCM_PRETEND_VERSION = version;
 
     pythonImportsCheck = [
       "pypush"
+      "pypush.emulated.nac"
     ];
 
     doCheck = false;
@@ -226,6 +254,12 @@ let
       "--set"
       "ONITRACK_ANISETTE_LIBS_TEMPLATE"
       "${anisetteLibs}"
+      "--set"
+      "SSL_CERT_FILE"
+      "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+      "--set"
+      "NIX_SSL_CERT_FILE"
+      "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
       "--prefix"
       "PATH"
       ":"

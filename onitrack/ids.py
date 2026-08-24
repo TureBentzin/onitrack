@@ -5,11 +5,14 @@ import gzip
 import hashlib
 import os
 import plistlib
+import ssl
 import time
 import uuid
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
-from urllib import request
+from urllib import error, request
+from urllib.parse import urlparse
 
 IDS_BAG_URL = "https://init.ess.apple.com/WebObjects/VCInit.woa/wa/getBag?ix=3"
 IDS_PROTOCOL_VERSION = "1750"
@@ -31,6 +34,8 @@ MULTIPLEX_CLIENT_DATA = {
 }
 MULTIPLEX_CAPABILITIES_NAME = "com.apple.private.alloy"
 IDS_BAG_CACHE: dict[str, str] = {}
+NAC_PRODUCT_TYPE = "MacBookAir8,1"
+NAC_OS_VERSION = "13.6.4"
 
 
 class IDSRegistrationError(RuntimeError):
@@ -73,14 +78,15 @@ def register_ids(
     state = dict(existing)
     identity = _load_or_create_identity(_dict_value(state.get("identity")))
     state["identity"] = identity.export_state()
+    ids_device = _nac_device(device)
 
     delegate = _login_ids_delegate(
         username=username,
         idms_pet=idms_pet,
         adsid=adsid,
         anisette_headers=anisette_headers,
-        device=device,
-        validation_data=_validation_data(state),
+        device=ids_device,
+        validation_data=_generate_validation_data(),
     )
     user_id = _string_value(delegate.get("profile-id"))
     auth_token = _string_value(delegate.get("auth-token"))
@@ -89,7 +95,7 @@ def register_ids(
             "IDS delegate response is missing profile-id/auth-token",
         )
 
-    auth = _authenticate_ds_id(user_id, auth_token, device)
+    auth = _authenticate_ds_id(user_id, auth_token, ids_device)
     handles = _get_handles(
         user_id=user_id,
         auth=auth,
@@ -105,8 +111,8 @@ def register_ids(
         push_token=push_token,
         push_cert=push_cert,
         push_key=push_key,
-        device=device,
-        validation_data=_validation_data(state),
+        device=ids_device,
+        validation_data=_generate_validation_data(),
     )
     state["users"] = {
         user_id: {
@@ -118,6 +124,11 @@ def register_ids(
     }
     state["registered"] = True
     state["service"] = MULTIPLEX_SERVICE
+    state["device_profile"] = {
+        "display_name": device.display_name,
+        "product_type": ids_device.product_type,
+        "source": "pypush-emulated-nac",
+    }
 
     sanitized_account = _drop_idms_pet(account_state)
     return IDSRegistrationResult(ids_state=state, account_state=sanitized_account)
@@ -243,12 +254,21 @@ def _login_ids_delegate(
     if validation_data:
         headers["X-Mme-Nas-Qualify"] = base64.b64encode(validation_data).decode("ascii")
     headers.update(anisette_headers)
-    response = _request_plist(
-        "https://setup.icloud.com/setup/signin/v2/login",
-        headers=headers,
-        body=body,
-        auth=(username, idms_pet),
-    )
+    try:
+        response = _request_plist(
+            "https://setup.icloud.com/setup/signin/v2/login",
+            headers=headers,
+            body=body,
+            auth=(username, idms_pet),
+        )
+    except IDSRegistrationError as exc:
+        if "localizedError='UNAUTHORIZED'" in str(exc):
+            raise IDSRegistrationError(
+                "IDS delegate login was unauthorized; run "
+                "`onitrack auth provision --refresh` and then retry "
+                "`onitrack apple register --debug-redacted`",
+            ) from exc
+        raise
     if int(response.get("status", 1)) != 0:
         raise IDSRegistrationError(f"IDS delegate login failed with status {response}")
     delegate_root = _dict_path(response, "delegates", "com.apple.private.ids")
@@ -487,20 +507,75 @@ def _request_plist(
         req_headers["Authorization"] = f"Basic {token}"
     method = "POST" if body is not None else "GET"
     req = request.Request(url, data=body, headers=req_headers, method=method)
-    with request.urlopen(req, timeout=45) as response:
-        payload = response.read()
-    if payload.startswith(b"\x1f\x8b"):
-        payload = gzip.decompress(payload)
-    decoded = plistlib.loads(payload)
+    try:
+        with _urlopen(req, timeout=45) as response:
+            payload = response.read()
+    except error.HTTPError as exc:
+        payload = exc.read()
+        decoded_error = _decode_plist_payload(payload)
+        if decoded_error is None:
+            raise IDSRegistrationError(
+                f"Apple request failed: HTTP {exc.code} {exc.reason}",
+            ) from exc
+        raise IDSRegistrationError(
+            f"Apple request failed: HTTP {exc.code} "
+            f"{_redacted_plist_summary(decoded_error)}",
+        ) from exc
+    except error.URLError as exc:
+        raise IDSRegistrationError(f"Apple request failed: {exc.reason}") from exc
+
+    decoded = _decode_plist_payload(payload)
+    if decoded is None:
+        raise IDSRegistrationError("Apple returned a malformed plist")
     if not isinstance(decoded, dict):
         raise IDSRegistrationError("Apple returned a non-dictionary plist")
     return decoded
 
 
+def _decode_plist_payload(payload: bytes) -> Any | None:
+    if payload.startswith(b"\x1f\x8b"):
+        try:
+            payload = gzip.decompress(payload)
+        except OSError:
+            return None
+    try:
+        return plistlib.loads(payload)
+    except plistlib.InvalidFileException:
+        return None
+
+
+def _redacted_plist_summary(data: Any) -> str:
+    if not isinstance(data, dict):
+        return "non-dictionary plist"
+    fields = []
+    for key in (
+        "status",
+        "error",
+        "localizedError",
+        "localized-error",
+        "description",
+        "message",
+        "error-message",
+    ):
+        value = data.get(key)
+        if isinstance(value, (str, int, float, bool)):
+            fields.append(f"{key}={value!r}")
+    if not fields:
+        fields.append("plist_keys=" + ",".join(sorted(str(key) for key in data)[:8]))
+    return " ".join(fields)
+
+
 def _bag(key: str) -> str:
     if not IDS_BAG_CACHE:
-        with request.urlopen(IDS_BAG_URL, timeout=30) as response:
-            body = response.read()
+        try:
+            with _urlopen(IDS_BAG_URL, timeout=30) as response:
+                body = response.read()
+        except error.HTTPError as exc:
+            raise IDSRegistrationError(
+                f"IDS bag request failed: HTTP {exc.code} {exc.reason}",
+            ) from exc
+        except error.URLError as exc:
+            raise IDSRegistrationError(f"IDS bag request failed: {exc.reason}") from exc
         outer = plistlib.loads(body)
         if not isinstance(outer, dict) or not isinstance(outer.get("bag"), bytes):
             raise IDSRegistrationError("IDS bag response is malformed")
@@ -514,6 +589,29 @@ def _bag(key: str) -> str:
     if value is None:
         raise IDSRegistrationError(f"IDS bag is missing {key}")
     return value
+
+
+def _urlopen(url: Any, *, timeout: int) -> Any:
+    return request.urlopen(
+        url,
+        timeout=timeout,
+        context=_ssl_context(_request_host(url)),
+    )
+
+
+def _request_host(url: Any) -> str:
+    raw_url = getattr(url, "full_url", url)
+    return urlparse(str(raw_url)).hostname or ""
+
+
+def _ssl_context(hostname: str) -> ssl.SSLContext:
+    if hostname.endswith(".ess.apple.com"):
+        return ssl._create_unverified_context()
+    try:
+        import certifi
+    except ImportError:
+        return ssl.create_default_context()
+    return ssl.create_default_context(cafile=certifi.where())
 
 
 def _sign_headers(
@@ -558,7 +656,7 @@ def _generate_auth_csr(user_id: str) -> tuple[Any, bytes]:
     csr = (
         x509.CertificateSigningRequestBuilder()
         .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)]))
-        .sign(key, hashes.SHA1())
+        .sign(key, hashes.SHA256())
     )
     from cryptography.hazmat.primitives import serialization
 
@@ -660,6 +758,35 @@ def _validation_data(state: dict[str, Any]) -> bytes:
         return base64.b64decode(encoded, validate=True)
     except ValueError as exc:
         raise IDSRegistrationError("stored IDS validation data is malformed") from exc
+
+
+def _generate_validation_data() -> bytes:
+    try:
+        from pypush.emulated import nac
+    except ImportError as exc:
+        raise IDSRegistrationError(
+            "pypush emulated NAC support is required for IDS validation data",
+        ) from exc
+
+    try:
+        try:
+            import urllib3
+
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        except ImportError:
+            pass
+        return bytes(nac.generate_validation_data())
+    except Exception as exc:
+        raise IDSRegistrationError("failed to generate IDS validation data") from exc
+
+
+def _nac_device(device: Any) -> Any:
+    return SimpleNamespace(
+        display_name=device.display_name,
+        os_version=NAC_OS_VERSION,
+        product_type=NAC_PRODUCT_TYPE,
+        udid=device.udid,
+    )
 
 
 def _private_device_data(device: Any) -> dict[str, Any]:

@@ -38,7 +38,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     auth_subparsers = auth_parser.add_subparsers(dest="auth_command")
-    auth_subparsers.add_parser("provision", help="interactively provision auth state")
+    auth_provision_parser = auth_subparsers.add_parser(
+        "provision",
+        help="interactively provision auth state",
+    )
+    auth_provision_parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="force a fresh Apple login even when saved state is logged in",
+    )
     auth_subparsers.add_parser("status", help="show offline auth state status")
     auth_subparsers.add_parser(
         "upgrade",
@@ -179,7 +187,10 @@ def main(argv: list[str] | None = None) -> int:
 
             match args.auth_command:
                 case "provision":
-                    return provision(resolve_config_dir(args.config_dir))
+                    return provision(
+                        resolve_config_dir(args.config_dir),
+                        refresh=args.refresh,
+                    )
                 case "status":
                     return print_status(resolve_config_dir(args.config_dir))
                 case "upgrade":

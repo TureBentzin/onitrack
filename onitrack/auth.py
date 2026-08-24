@@ -27,7 +27,7 @@ ANISETTE_LIBS_TEMPLATE_ENV = "ONITRACK_ANISETTE_LIBS_TEMPLATE"
 ANISETTE_LIBS_FILE = "anisette-libs.tar"
 
 
-def provision(config_dir: Path) -> int:
+def provision(config_dir: Path, *, refresh: bool = False) -> int:
     config_dir = ensure_config_dir(config_dir)
     try:
         migrate_legacy_secrets(config_dir)
@@ -35,9 +35,9 @@ def provision(config_dir: Path) -> int:
         print(f"auth: secret_store_error: {exc}")
         return 1
     account_path = account_config_path(config_dir)
-    account = _load_or_create_account(account_path, config_dir)
+    account = _load_or_create_account(account_path, config_dir, refresh=refresh)
 
-    if _login_state_name(account.login_state) == "LOGGED_IN":
+    if not refresh and _login_state_name(account.login_state) == "LOGGED_IN":
         _save_account(account_path, account)
         _close_account(account)
         print("account: logged_in")
@@ -82,11 +82,16 @@ def upgrade(config_dir: Path) -> int:
     return register(config_dir, debug_redacted=False)
 
 
-def _load_or_create_account(account_path: Path, config_dir: Path) -> Any:
+def _load_or_create_account(
+    account_path: Path,
+    config_dir: Path,
+    *,
+    refresh: bool = False,
+) -> Any:
     from findmy import AppleAccount, LocalAnisetteProvider
 
     libs_path = _anisette_libs_path(config_dir)
-    state = _load_account_state(config_dir)
+    state = None if refresh else _load_account_state(config_dir)
     if state is not None:
         return AppleAccount.from_json(state, anisette_libs_path=libs_path)
 

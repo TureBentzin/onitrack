@@ -18,6 +18,15 @@ def test_doctor_command(capsys):
     assert captured.out.strip() == "onitrack base environment available"
 
 
+def test_auth_provision_accepts_refresh_help(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["auth", "provision", "--help"])
+
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    assert "--refresh" in output
+
+
 def test_people_list_requires_output_mode(capsys):
     with pytest.raises(SystemExit) as exc:
         main(["people", "list"])

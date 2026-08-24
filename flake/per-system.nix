@@ -63,6 +63,8 @@
         ];
 
         ONITRACK_ANISETTE_LIBS_TEMPLATE = "${packaged.anisetteLibs}";
+        SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+        NIX_SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
       };
     };
 }
