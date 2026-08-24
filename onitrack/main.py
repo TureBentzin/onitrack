@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 from onitrack import __version__
-from onitrack.state import default_state_dir
+from onitrack.state import resolve_config_dir
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -25,10 +25,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     auth_parser = subparsers.add_parser("auth", help="manage Apple Account auth")
     auth_parser.add_argument(
-        "--state-dir",
+        "--config-dir",
         type=Path,
-        default=default_state_dir(),
-        help="state directory (default: .state/onitrack)",
+        default=None,
+        help="config directory (default: .config/onitrack)",
+    )
+    auth_parser.add_argument(
+        "--state-dir",
+        dest="config_dir",
+        type=Path,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     auth_subparsers = auth_parser.add_subparsers(dest="auth_command")
     auth_subparsers.add_parser("provision", help="interactively provision auth state")
@@ -53,9 +60,9 @@ def main(argv: list[str] | None = None) -> int:
 
             match args.auth_command:
                 case "provision":
-                    return provision(args.state_dir)
+                    return provision(resolve_config_dir(args.config_dir))
                 case "status":
-                    return print_status(args.state_dir)
+                    return print_status(resolve_config_dir(args.config_dir))
                 case None:
                     parser.error("auth requires a subcommand")
         case None:

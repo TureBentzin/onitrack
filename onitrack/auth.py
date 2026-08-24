@@ -4,25 +4,28 @@ import asyncio
 import getpass
 import inspect
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
 from onitrack.state import (
-    account_state_path,
-    ensure_state_dir,
+    CONFIG_FILE_MODE,
+    account_config_path,
+    config_status,
+    ensure_config_dir,
     read_json,
     sanitize_account_state,
-    state_status,
     write_json_atomic,
 )
 
-ANISETTE_LIBS_ENV = "ONITRACK_ANISETTE_LIBS"
+ANISETTE_LIBS_TEMPLATE_ENV = "ONITRACK_ANISETTE_LIBS_TEMPLATE"
+ANISETTE_LIBS_FILE = "anisette-libs.tar"
 
 
-def provision(state_dir: Path) -> int:
-    state_dir = ensure_state_dir(state_dir)
-    account_path = account_state_path(state_dir)
-    account = _load_or_create_account(account_path)
+def provision(config_dir: Path) -> int:
+    config_dir = ensure_config_dir(config_dir)
+    account_path = account_config_path(config_dir)
+    account = _load_or_create_account(account_path, config_dir)
 
     if _login_state_name(account.login_state) == "LOGGED_IN":
         _save_account(account_path, account)
@@ -49,19 +52,19 @@ def provision(state_dir: Path) -> int:
         _close_account(account)
 
 
-def print_status(state_dir: Path) -> int:
-    status = state_status(state_dir)
+def print_status(config_dir: Path) -> int:
+    status = config_status(config_dir)
     print(f"account: {status['account']}")
-    print(f"state_dir: {status['state_dir']}")
+    print(f"config_dir: {status['config_dir']}")
     print(f"account_file: {status['account_file']}")
     print(f"password_persisted: {status['password_persisted']}")
     return 0
 
 
-def _load_or_create_account(account_path: Path) -> Any:
+def _load_or_create_account(account_path: Path, config_dir: Path) -> Any:
     from findmy import AppleAccount, LocalAnisetteProvider
 
-    libs_path = _anisette_libs_path()
+    libs_path = _anisette_libs_path(config_dir)
     state = read_json(account_path)
     if state is not None:
         return AppleAccount.from_json(state, anisette_libs_path=libs_path)
@@ -117,13 +120,36 @@ def _save_account(account_path: Path, account: Any) -> None:
 def _close_account(account: Any) -> None:
     close_result = account.close()
     if inspect.isawaitable(close_result):
-        asyncio.run(close_result)
+        loop = getattr(account, "_evt_loop", None)
+        if loop is not None and not loop.is_running():
+            loop.run_until_complete(close_result)
+        else:
+            asyncio.run(close_result)
 
 
 def _login_state_name(login_state: Any) -> str:
     return str(getattr(login_state, "name", login_state))
 
 
-def _anisette_libs_path() -> Path | None:
-    raw_path = os.environ.get(ANISETTE_LIBS_ENV)
-    return Path(raw_path) if raw_path else None
+def _anisette_libs_path(config_dir: Path) -> Path | None:
+    template = os.environ.get(ANISETTE_LIBS_TEMPLATE_ENV)
+    if not template:
+        return None
+
+    libs_path = config_dir / ANISETTE_LIBS_FILE
+    if not libs_path.exists():
+        _copy_private_file(Path(template), libs_path)
+    return libs_path
+
+
+def _copy_private_file(source: Path, destination: Path) -> None:
+    ensure_config_dir(destination.parent)
+    tmp_path = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
+    try:
+        shutil.copyfile(source, tmp_path)
+        tmp_path.chmod(CONFIG_FILE_MODE)
+        os.replace(tmp_path, destination)
+        destination.chmod(CONFIG_FILE_MODE)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()

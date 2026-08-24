@@ -1,10 +1,14 @@
 # Nix
 result
 .direnv/
+.config/
 .state/
 
 # Documents folder
 documents/
 
-# pycaches
-**/__pycache__
+# Python/tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/

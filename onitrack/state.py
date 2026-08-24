@@ -5,23 +5,31 @@ import os
 from pathlib import Path
 from typing import Any
 
-STATE_DIR_MODE = 0o700
-STATE_FILE_MODE = 0o600
-ACCOUNT_STATE_FILE = "account.json"
+CONFIG_DIR_ENV = "ONITRACK_CONFIG_DIR"
+CONFIG_DIR_MODE = 0o700
+CONFIG_FILE_MODE = 0o600
+ACCOUNT_CONFIG_FILE = "account.json"
 
 
-def default_state_dir() -> Path:
-    return Path.cwd() / ".state" / "onitrack"
+def default_config_dir() -> Path:
+    env_path = os.environ.get(CONFIG_DIR_ENV)
+    if env_path:
+        return Path(env_path)
+    return Path.cwd() / ".config" / "onitrack"
 
 
-def ensure_state_dir(path: Path) -> Path:
-    path.mkdir(mode=STATE_DIR_MODE, parents=True, exist_ok=True)
-    path.chmod(STATE_DIR_MODE)
+def resolve_config_dir(path: Path | None = None) -> Path:
+    return path if path is not None else default_config_dir()
+
+
+def ensure_config_dir(path: Path) -> Path:
+    path.mkdir(mode=CONFIG_DIR_MODE, parents=True, exist_ok=True)
+    path.chmod(CONFIG_DIR_MODE)
     return path
 
 
-def account_state_path(state_dir: Path) -> Path:
-    return state_dir / ACCOUNT_STATE_FILE
+def account_config_path(config_dir: Path) -> Path:
+    return config_dir / ACCOUNT_CONFIG_FILE
 
 
 def read_json(path: Path) -> dict[str, Any] | None:
@@ -39,7 +47,7 @@ def read_json(path: Path) -> dict[str, Any] | None:
 
 
 def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
-    ensure_state_dir(path.parent)
+    ensure_config_dir(path.parent)
     tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     encoded = json.dumps(data, indent=2, sort_keys=True).encode("utf-8")
     encoded += b"\n"
@@ -47,7 +55,7 @@ def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
     fd = os.open(
         tmp_path,
         os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-        STATE_FILE_MODE,
+        CONFIG_FILE_MODE,
     )
     try:
         with os.fdopen(fd, "wb") as handle:
@@ -55,7 +63,7 @@ def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_path, path)
-        path.chmod(STATE_FILE_MODE)
+        path.chmod(CONFIG_FILE_MODE)
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
@@ -86,9 +94,9 @@ def state_file_mode(path: Path) -> int | None:
     return path.stat().st_mode & 0o777
 
 
-def state_status(state_dir: Path) -> dict[str, str]:
-    account_path = account_state_path(state_dir)
-    dir_mode = state_file_mode(state_dir)
+def config_status(config_dir: Path) -> dict[str, str]:
+    account_path = account_config_path(config_dir)
+    dir_mode = state_file_mode(config_dir)
     file_mode = state_file_mode(account_path)
     account_state = read_json(account_path)
 
@@ -100,8 +108,10 @@ def state_status(state_dir: Path) -> dict[str, str]:
 
     return {
         "account": login,
-        "state_dir": "ok" if dir_mode == STATE_DIR_MODE else "missing_or_bad_mode",
-        "account_file": "ok" if file_mode == STATE_FILE_MODE else "missing_or_bad_mode",
+        "config_dir": "ok" if dir_mode == CONFIG_DIR_MODE else "missing_or_bad_mode",
+        "account_file": (
+            "ok" if file_mode == CONFIG_FILE_MODE else "missing_or_bad_mode"
+        ),
         "password_persisted": password_persisted,
     }
 

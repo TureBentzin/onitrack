@@ -57,7 +57,7 @@ let
     doCheck = false;
   };
 
-  anisetteLibs = pkgs.fetchurl {
+  anisetteLibsRaw = pkgs.fetchurl {
     url = "https://anisette.dl.mikealmel.ooo/libs?arch=arm64-v8a";
     hash = "sha256-WfahBO898eZjDIXeclBy9agPJt9DyD34VS4NVd0e6WY=";
   };
@@ -97,6 +97,19 @@ let
 
     doCheck = false;
   };
+
+  anisetteLibs =
+    pkgs.runCommand "anisette-libs.tar"
+      {
+        nativeBuildInputs = [
+          (python.withPackages (_: [
+            anisette
+          ]))
+        ];
+      }
+      ''
+        python -c 'from anisette import Anisette; Anisette.init("${anisetteLibsRaw}").save_libs("${placeholder "out"}")'
+      '';
 
   findmy = pythonPackages.buildPythonPackage rec {
     pname = "findmy";
@@ -166,7 +179,7 @@ let
 
     makeWrapperArgs = [
       "--set"
-      "ONITRACK_ANISETTE_LIBS"
+      "ONITRACK_ANISETTE_LIBS_TEMPLATE"
       "${anisetteLibs}"
     ];
   };
