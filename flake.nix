@@ -30,19 +30,80 @@
           ...
         }:
         let
-          pkgsPackages = with pkgs; [
-            # FIXME: add pkgs packages here
-          ];
-          packages = [
-            # FIXME: add packages you defined here
-          ]
-          ++ pkgsPackages;
+          python = pkgs.python3;
+          pythonPackages = python.pkgs;
+
+          onitrack = pythonPackages.buildPythonApplication {
+            pname = projectName;
+            version = "0.1.0";
+            pyproject = true;
+
+            src = ./.;
+
+            build-system = with pythonPackages; [
+              setuptools
+            ];
+
+            nativeCheckInputs = with pythonPackages; [
+              pytest
+            ];
+
+            pythonImportsCheck = [
+              "onitrack"
+            ];
+
+            checkPhase = ''
+              runHook preCheck
+              pytest
+              runHook postCheck
+            '';
+          };
         in
         {
+          packages = {
+            inherit onitrack;
+            default = onitrack;
+          };
+
+          apps = {
+            onitrack = {
+              type = "app";
+              program = "${self'.packages.onitrack}/bin/onitrack";
+            };
+            default = self'.apps.onitrack;
+          };
+
+          checks = {
+            unit = onitrack;
+            lint =
+              pkgs.runCommand "${projectName}-lint"
+                {
+                  nativeBuildInputs = [
+                    pythonPackages.ruff
+                  ];
+                }
+                ''
+                  ruff check --no-cache ${./.}
+                  touch $out
+                '';
+          };
+
+          formatter = pkgs.nixfmt;
+
           devShells.default = pkgs.mkShell {
             name = "${projectName}-devshell";
 
-            inherit packages;
+            packages = [
+              python
+              pythonPackages.pytest
+              pythonPackages.ruff
+              pythonPackages.mypy
+              pythonPackages.build
+              pkgs.curl
+              pkgs.git
+              pkgs.jq
+              pkgs.nixfmt
+            ];
           };
         };
       flake = {
