@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +15,12 @@ ACCOUNT_CONFIG_FILE = "account.json"
 DEVICE_CONFIG_FILE = "device.json"
 PRIVACY_CONFIG_FILE = "privacy.json"
 PEOPLE_CONFIG_FILE = "people.json"
+AGE_IDENTITY_FILE = "age-identity.txt"
+SECRETS_FILE = "secrets.age"
+
+
+class SecretStoreError(RuntimeError):
+    pass
 
 
 def default_config_dir() -> Path:
@@ -45,6 +54,14 @@ def privacy_config_path(config_dir: Path) -> Path:
 
 def people_config_path(config_dir: Path) -> Path:
     return config_dir / PEOPLE_CONFIG_FILE
+
+
+def age_identity_path(config_dir: Path) -> Path:
+    return config_dir / AGE_IDENTITY_FILE
+
+
+def secrets_path(config_dir: Path) -> Path:
+    return config_dir / SECRETS_FILE
 
 
 def read_json(path: Path) -> dict[str, Any] | None:
@@ -84,12 +101,241 @@ def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
             tmp_path.unlink()
 
 
+def ensure_age_identity(config_dir: Path) -> Path:
+    ensure_config_dir(config_dir)
+    path = age_identity_path(config_dir)
+    if path.exists():
+        path.chmod(CONFIG_FILE_MODE)
+        return path
+
+    age_keygen = _require_tool("age-keygen")
+    try:
+        result = subprocess.run(
+            [age_keygen],
+            check=True,
+            capture_output=True,
+        )
+    except OSError as exc:
+        raise SecretStoreError("failed to run age-keygen") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode("utf-8", errors="replace").strip()
+        msg = "age-keygen failed"
+        if detail:
+            msg = f"{msg}: {detail}"
+        raise SecretStoreError(msg) from exc
+
+    _write_private_bytes_atomic(path, result.stdout)
+    return path
+
+
+def read_secrets(config_dir: Path) -> dict[str, Any]:
+    path = secrets_path(config_dir)
+    if not path.exists():
+        return {}
+
+    age = _require_tool("age")
+    identity_path = ensure_age_identity(config_dir)
+    try:
+        result = subprocess.run(
+            [age, "--decrypt", "--identity", os.fspath(identity_path)],
+            input=path.read_bytes(),
+            check=True,
+            capture_output=True,
+        )
+    except OSError as exc:
+        raise SecretStoreError("failed to run age") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode("utf-8", errors="replace").strip()
+        msg = "failed to decrypt encrypted Onitrack secrets"
+        if detail:
+            msg = f"{msg}: {detail}"
+        raise SecretStoreError(msg) from exc
+
+    if not result.stdout:
+        return {}
+    try:
+        data = json.loads(result.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SecretStoreError("encrypted Onitrack secrets are malformed") from exc
+    if not isinstance(data, dict):
+        raise SecretStoreError("encrypted Onitrack secrets must be a JSON object")
+    return data
+
+
+def write_secrets(config_dir: Path, data: dict[str, Any]) -> None:
+    ensure_config_dir(config_dir)
+    identity_path = ensure_age_identity(config_dir)
+    public_key = _age_public_key(identity_path)
+    age = _require_tool("age")
+    encoded = json.dumps(data, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+
+    try:
+        result = subprocess.run(
+            [age, "--encrypt", "--recipient", public_key],
+            input=encoded,
+            check=True,
+            capture_output=True,
+        )
+    except OSError as exc:
+        raise SecretStoreError("failed to run age") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode("utf-8", errors="replace").strip()
+        msg = "failed to encrypt Onitrack secrets"
+        if detail:
+            msg = f"{msg}: {detail}"
+        raise SecretStoreError(msg) from exc
+
+    _write_private_bytes_atomic(secrets_path(config_dir), result.stdout)
+
+
+def secret_section(config_dir: Path, section: str) -> dict[str, Any]:
+    data = read_secrets(config_dir).get(section)
+    return data if isinstance(data, dict) else {}
+
+
+def write_secret_section(config_dir: Path, section: str, value: dict[str, Any]) -> None:
+    data = read_secrets(config_dir)
+    data[section] = value
+    write_secrets(config_dir, data)
+
+
+def migrate_legacy_secrets(config_dir: Path) -> None:
+    ensure_config_dir(config_dir)
+    secrets = read_secrets(config_dir)
+    changed = False
+
+    account_path = account_config_path(config_dir)
+    account_state = read_json(account_path)
+    if (
+        account_state
+        and "account" not in secrets
+        and account_state != account_metadata(account_state)
+    ):
+        secrets["account"] = account_state
+        changed = True
+
+    privacy_path = privacy_config_path(config_dir)
+    privacy_state = read_json(privacy_path)
+    if privacy_state:
+        privacy_secrets = _dict_copy(secrets.get("privacy"))
+        salt = privacy_state.get("anonymization_salt")
+        if (
+            isinstance(salt, str)
+            and salt
+            and "anonymization_salt" not in privacy_secrets
+        ):
+            privacy_secrets["anonymization_salt"] = salt
+            secrets["privacy"] = privacy_secrets
+            changed = True
+
+    people_path = people_config_path(config_dir)
+    people_state = read_json(people_path)
+    if people_state:
+        people_secret_keys = {
+            "advertised_ids",
+            "apns",
+            "apple_tokens",
+            "findmy",
+            "ids",
+            "keys",
+            "registration",
+        }
+        secret_people = _dict_copy(secrets.get("people"))
+        for key in people_secret_keys:
+            if key in people_state and key not in secret_people:
+                secret_people[key] = people_state[key]
+                changed = True
+        if secret_people:
+            secrets["people"] = secret_people
+
+    if changed:
+        write_secrets(config_dir, secrets)
+        read_secrets(config_dir)
+
+    if account_state:
+        metadata = account_metadata(account_state)
+        if metadata != account_state:
+            write_json_atomic(account_path, metadata)
+    if privacy_state:
+        write_json_atomic(privacy_path, {"encrypted": True})
+    if people_state:
+        metadata = {
+            key: value
+            for key, value in people_state.items()
+            if key not in {
+                "advertised_ids",
+                "apns",
+                "apple_tokens",
+                "findmy",
+                "ids",
+                "keys",
+                "registration",
+            }
+        }
+        write_json_atomic(people_path, metadata)
+
+
+def account_metadata(state: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    login = state.get("login")
+    if isinstance(login, dict):
+        metadata["login"] = {"state": login.get("state")}
+    account = state.get("account")
+    if isinstance(account, dict):
+        username = account.get("username")
+        metadata["account"] = {
+            "username": username if isinstance(username, str) else None,
+        }
+    return metadata
+
+
 def sanitize_account_state(data: dict[str, Any]) -> dict[str, Any]:
     sanitized = _scrub_passwords(data)
     if not isinstance(sanitized, dict):
         msg = "account state must be a JSON object"
         raise ValueError(msg)
     return sanitized
+
+
+def _write_private_bytes_atomic(path: Path, data: bytes) -> None:
+    ensure_config_dir(path.parent)
+    tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    fd = os.open(
+        tmp_path,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        CONFIG_FILE_MODE,
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        path.chmod(CONFIG_FILE_MODE)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _require_tool(name: str) -> str:
+    path = shutil.which(name)
+    if path is None:
+        raise SecretStoreError(
+            f"`{name}` is required for encrypted Onitrack secret storage",
+        )
+    return path
+
+
+def _age_public_key(identity_path: Path) -> str:
+    content = identity_path.read_text(encoding="utf-8")
+    match = re.search(r"^# public key: (age1[0-9a-z]+)$", content, re.MULTILINE)
+    if match is None:
+        raise SecretStoreError("age identity is missing its public recipient key")
+    return match.group(1)
+
+
+def _dict_copy(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
 
 
 def _scrub_passwords(value: Any) -> Any:

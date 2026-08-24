@@ -2,15 +2,25 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from onitrack.state import (
+    AGE_IDENTITY_FILE,
     CONFIG_DIR_MODE,
     CONFIG_FILE_MODE,
+    SECRETS_FILE,
+    SecretStoreError,
     account_config_path,
     config_status,
     default_config_dir,
     ensure_config_dir,
+    migrate_legacy_secrets,
+    privacy_config_path,
+    read_secrets,
     sanitize_account_state,
+    secrets_path,
     write_json_atomic,
+    write_secrets,
 )
 
 
@@ -118,3 +128,55 @@ def test_anisette_libs_template_is_copied_to_writable_config(monkeypatch, tmp_pa
     assert libs_path == config_dir / ANISETTE_LIBS_FILE
     assert libs_path.read_bytes() == b"template"
     assert libs_path.stat().st_mode & 0o777 == CONFIG_FILE_MODE
+
+
+def test_encrypted_secret_store_creates_private_identity_and_round_trips(tmp_path):
+    config_dir = ensure_config_dir(tmp_path / "config")
+
+    write_secrets(config_dir, {"privacy": {"anonymization_salt": "salt"}})
+
+    assert read_secrets(config_dir) == {"privacy": {"anonymization_salt": "salt"}}
+    assert (config_dir / AGE_IDENTITY_FILE).stat().st_mode & 0o777 == CONFIG_FILE_MODE
+    assert (config_dir / SECRETS_FILE).stat().st_mode & 0o777 == CONFIG_FILE_MODE
+    assert "salt" not in secrets_path(config_dir).read_text(encoding="utf-8")
+
+
+def test_migration_scrubs_legacy_plaintext_only_after_encrypted_readback(tmp_path):
+    config_dir = ensure_config_dir(tmp_path / "config")
+    write_json_atomic(
+        account_config_path(config_dir),
+        {"login": {"state": 3, "data": {"dsid": "123"}}, "account": {"username": "a"}},
+    )
+    write_json_atomic(
+        privacy_config_path(config_dir),
+        {"anonymization_salt": "plain-salt"},
+    )
+
+    migrate_legacy_secrets(config_dir)
+
+    secrets = read_secrets(config_dir)
+    assert secrets["account"]["login"]["data"]["dsid"] == "123"
+    assert secrets["privacy"]["anonymization_salt"] == "plain-salt"
+    assert "dsid" not in account_config_path(config_dir).read_text(encoding="utf-8")
+    assert "plain-salt" not in privacy_config_path(config_dir).read_text(
+        encoding="utf-8",
+    )
+
+
+def test_metadata_only_account_file_is_not_promoted_to_secrets(tmp_path):
+    config_dir = ensure_config_dir(tmp_path / "config")
+    write_json_atomic(
+        account_config_path(config_dir),
+        {"login": {"state": 3}, "account": {"username": "a"}},
+    )
+
+    migrate_legacy_secrets(config_dir)
+
+    assert "account" not in read_secrets(config_dir)
+
+
+def test_missing_age_tools_produce_clear_error(monkeypatch, tmp_path):
+    monkeypatch.setenv("PATH", os.fspath(tmp_path / "empty"))
+
+    with pytest.raises(SecretStoreError, match="age-keygen"):
+        write_secrets(tmp_path, {"privacy": {}})

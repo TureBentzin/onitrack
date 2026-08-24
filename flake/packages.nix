@@ -163,8 +163,9 @@ let
       findmy
     ];
 
-    nativeCheckInputs = with pythonPackages; [
-      pytest
+    nativeCheckInputs = [
+      pythonPackages.pytest
+      pkgs.age
     ];
 
     pythonImportsCheck = [
@@ -181,6 +182,10 @@ let
       "--set"
       "ONITRACK_ANISETTE_LIBS_TEMPLATE"
       "${anisetteLibs}"
+      "--prefix"
+      "PATH"
+      ":"
+      "${pkgs.lib.makeBinPath [ pkgs.age ]}"
     ];
   };
 in

@@ -10,12 +10,17 @@ from typing import Any
 
 from onitrack.state import (
     CONFIG_FILE_MODE,
+    SecretStoreError,
     account_config_path,
+    account_metadata,
     config_status,
     ensure_config_dir,
+    migrate_legacy_secrets,
     read_json,
     sanitize_account_state,
+    secret_section,
     write_json_atomic,
+    write_secret_section,
 )
 
 ANISETTE_LIBS_TEMPLATE_ENV = "ONITRACK_ANISETTE_LIBS_TEMPLATE"
@@ -24,6 +29,11 @@ ANISETTE_LIBS_FILE = "anisette-libs.tar"
 
 def provision(config_dir: Path) -> int:
     config_dir = ensure_config_dir(config_dir)
+    try:
+        migrate_legacy_secrets(config_dir)
+    except SecretStoreError as exc:
+        print(f"auth: secret_store_error: {exc}")
+        return 1
     account_path = account_config_path(config_dir)
     account = _load_or_create_account(account_path, config_dir)
 
@@ -53,6 +63,11 @@ def provision(config_dir: Path) -> int:
 
 
 def print_status(config_dir: Path) -> int:
+    try:
+        migrate_legacy_secrets(config_dir)
+    except SecretStoreError as exc:
+        print(f"auth: secret_store_error: {exc}")
+        return 1
     status = config_status(config_dir)
     print(f"account: {status['account']}")
     print(f"config_dir: {status['config_dir']}")
@@ -61,11 +76,35 @@ def print_status(config_dir: Path) -> int:
     return 0
 
 
+def upgrade(config_dir: Path) -> int:
+    try:
+        migrate_legacy_secrets(config_dir)
+        from onitrack.people import load_or_create_device_identity
+
+        device = load_or_create_device_identity(config_dir)
+    except SecretStoreError as exc:
+        print(f"auth: secret_store_error: {exc}")
+        return 1
+
+    people = secret_section(config_dir, "people")
+    has_apns = bool(_dict_value(people.get("apns")).get("courier_token"))
+    has_ids = bool(_dict_value(people.get("ids")))
+    status = "registered" if has_apns and has_ids else "upgrade_required"
+    print(f"apple: {status}")
+    print(f"device: {device.display_name} {device.product_type}")
+    if status != "registered":
+        print(
+            "apple: APNs/IDS live registration is not available in this build; "
+            "encrypted state is ready",
+        )
+    return 0
+
+
 def _load_or_create_account(account_path: Path, config_dir: Path) -> Any:
     from findmy import AppleAccount, LocalAnisetteProvider
 
     libs_path = _anisette_libs_path(config_dir)
-    state = read_json(account_path)
+    state = _load_account_state(config_dir)
     if state is not None:
         return AppleAccount.from_json(state, anisette_libs_path=libs_path)
 
@@ -114,7 +153,18 @@ def _prompt_method_index(method_count: int) -> int:
 
 def _save_account(account_path: Path, account: Any) -> None:
     state = sanitize_account_state(account.to_json())
-    write_json_atomic(account_path, state)
+    write_secret_section(account_path.parent, "account", state)
+    write_json_atomic(account_path, account_metadata(state))
+
+
+def _load_account_state(config_dir: Path) -> dict[str, Any] | None:
+    encrypted = secret_section(config_dir, "account")
+    if encrypted:
+        return encrypted
+    legacy = read_json(account_config_path(config_dir))
+    if legacy and legacy != account_metadata(legacy):
+        return legacy
+    return None
 
 
 def _close_account(account: Any) -> None:
@@ -153,3 +203,7 @@ def _copy_private_file(source: Path, destination: Path) -> None:
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
+
+
+def _dict_value(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}

@@ -54,6 +54,7 @@
 
         packages = [
           devPython
+          pkgs.age
           pkgs.curl
           pkgs.git
           pkgs.jq

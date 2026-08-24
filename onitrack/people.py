@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import plistlib
+import socket
 import sys
 import time
 import uuid
@@ -18,20 +19,26 @@ from urllib import error, request
 from onitrack.auth import _anisette_libs_path, _close_account, _login_state_name
 from onitrack.state import (
     CONFIG_FILE_MODE,
+    SecretStoreError,
     account_config_path,
+    account_metadata,
     device_config_path,
+    ensure_config_dir,
+    migrate_legacy_secrets,
     people_config_path,
     privacy_config_path,
     read_json,
+    secret_section,
     write_json_atomic,
+    write_secret_section,
 )
 
 FMF_ENDPOINT_TEMPLATE = (
     "https://{host}/fmipservice/friends/fmfd/{dsid}/{device_udid}/initClient"
 )
 DEFAULT_FMF_HOST = "p01-fmfmobile.icloud.com"
-DEFAULT_DISPLAY_NAME = "Onitrack"
-APPLE_PRODUCT_TYPE = "MacBookPro18,3"
+APPLE_PRODUCT_TYPE = "Macmini9,1"
+APPLE_FALLBACK_PRODUCT_TYPE = "MacBookPro18,3"
 APPLE_OS_VERSION = "14.6"
 FINDMYLOCATED_BUNDLE = "com.apple.findmy.findmylocated"
 SEARCHPARTY_ENDPOINT = "https://gateway.icloud.com/findmyservice/fetch"
@@ -101,12 +108,16 @@ class LocationFix:
 
 def list_people(config_dir: Path, *, anonymise: bool) -> int:
     try:
+        migrate_legacy_secrets(config_dir)
         relationships = PeopleClient(config_dir).list_relationships()
         payload = (
             anonymized_relationships(config_dir, relationships)
             if anonymise
             else plain_relationships(relationships)
         )
+    except SecretStoreError as exc:
+        print(f"people: secret_store_error: {exc}")
+        return 1
     except PeopleProvisioningError as exc:
         print(f"people: provisioning_error: {exc}")
         return 1
@@ -128,7 +139,11 @@ def set_people_alias(config_dir: Path, *, alias: str, person_id: str) -> int:
         return 1
 
     try:
+        migrate_legacy_secrets(config_dir)
         relationships = PeopleClient(config_dir).list_relationships()
+    except SecretStoreError as exc:
+        print(f"people: secret_store_error: {exc}")
+        return 1
     except PeopleProvisioningError as exc:
         print(f"people: provisioning_error: {exc}")
         return 1
@@ -150,7 +165,11 @@ def set_people_alias(config_dir: Path, *, alias: str, person_id: str) -> int:
 
 def setup_people_alias(config_dir: Path) -> int:
     try:
+        migrate_legacy_secrets(config_dir)
         relationships = PeopleClient(config_dir).list_relationships()
+    except SecretStoreError as exc:
+        print(f"people: secret_store_error: {exc}")
+        return 1
     except PeopleProvisioningError as exc:
         print(f"people: provisioning_error: {exc}")
         return 1
@@ -219,14 +238,18 @@ def get_people_location(
     anonymise: bool,
     debug_redacted: bool = False,
 ) -> int:
-    logger = DebugLogger(config_dir, enabled=debug_redacted)
     try:
+        migrate_legacy_secrets(config_dir)
+        logger = DebugLogger(config_dir, enabled=debug_redacted)
         fix = PeopleClient(config_dir, debug_logger=logger).get_location(alias)
         payload = (
             anonymized_location(config_dir, fix)
             if anonymise
             else plain_location(fix)
         )
+    except SecretStoreError as exc:
+        print(f"people: secret_store_error: {exc}")
+        return 1
     except (PeopleProvisioningError, PeopleLocationError) as exc:
         print(f"people: provisioning_error: {exc}")
         return 1
@@ -330,13 +353,18 @@ class PeopleClient:
 
     def _load_logged_in_account(self) -> Any:
         account_path = account_config_path(self.config_dir)
-        if not account_path.exists():
+        account_state = secret_section(self.config_dir, "account")
+        if not account_state and account_path.exists():
+            legacy_account_state = read_json(account_path) or {}
+            if legacy_account_state != account_metadata(legacy_account_state):
+                account_state = legacy_account_state
+        if not account_state:
             raise PeopleProvisioningError("run `onitrack auth provision` first")
 
         from findmy import AppleAccount
 
         account = AppleAccount.from_json(
-            read_json(account_path),
+            account_state,
             anisette_libs_path=_anisette_libs_path(self.config_dir),
         )
         if _login_state_name(account.login_state) != "LOGGED_IN":
@@ -395,6 +423,7 @@ class PeopleClient:
                 "contextBundleApp": FINDMYLOCATED_BUNDLE,
                 "currentTime": int(time.time() * 1000),
                 "deviceUDID": device.udid,
+                "deviceDisplayName": device.display_name,
                 "productType": device.product_type,
                 "osVersion": device.os_version,
             },
@@ -421,6 +450,11 @@ class PeopleClient:
                 "dsid": dsid,
                 "fmf_host": host,
                 "response_keys": sorted(response),
+                "device_display_name": device.display_name,
+                "device_profile": device.product_type,
+                "device_profile_fallback": (
+                    device.product_type == APPLE_FALLBACK_PRODUCT_TYPE
+                ),
                 "following_count": len(response.get("following", []))
                 if isinstance(response.get("following"), list)
                 else 0,
@@ -471,6 +505,8 @@ class PeopleClient:
                 "apsToken": apns_token,
                 "clientId": device.udid,
                 "contextApp": FINDMYLOCATED_BUNDLE,
+                "deviceDisplayName": device.display_name,
+                "productType": device.product_type,
                 "shallowStats": {},
                 "liveStats": {},
                 "nearbyWatchIdentifiers": [],
@@ -490,6 +526,11 @@ class PeopleClient:
                 "dsid": dsid,
                 "fmId": fm_id,
                 "advertised_id": advertised_id,
+                "device_display_name": device.display_name,
+                "device_profile": device.product_type,
+                "device_profile_fallback": (
+                    device.product_type == APPLE_FALLBACK_PRODUCT_TYPE
+                ),
                 "response_keys": sorted(response),
                 "location_payload_count": len(payload)
                 if isinstance(payload, list)
@@ -634,12 +675,30 @@ def relationship_for_person_id(
 
 
 def load_people_state(config_dir: Path) -> dict[str, Any]:
-    return read_json(people_config_path(config_dir)) or {}
+    metadata = read_json(people_config_path(config_dir)) or {}
+    secrets = secret_section(config_dir, "people")
+    return _merge_dicts(secrets, metadata)
 
 
 def write_people_state(config_dir: Path, state: dict[str, Any]) -> None:
     path = people_config_path(config_dir)
-    write_json_atomic(path, state)
+    secret_keys = {
+        "advertised_ids",
+        "apns",
+        "apple_tokens",
+        "findmy",
+        "ids",
+        "keys",
+        "registration",
+    }
+    metadata = {key: value for key, value in state.items() if key not in secret_keys}
+    secrets = secret_section(config_dir, "people")
+    for key in secret_keys:
+        if key in state:
+            secrets[key] = state[key]
+    if secrets:
+        write_secret_section(config_dir, "people", secrets)
+    write_json_atomic(path, metadata)
     path.chmod(CONFIG_FILE_MODE)
 
 
@@ -902,18 +961,37 @@ class DebugRedactor:
 
 
 def load_or_create_privacy_salt(config_dir: Path) -> bytes:
+    state = secret_section(config_dir, "privacy")
+    salt = _string_value(state.get("anonymization_salt"))
+    if salt:
+        return base64.b64decode(salt)
+
     path = privacy_config_path(config_dir)
-    state = read_json(path)
-    if state is not None:
-        salt = _string_value(state.get("anonymization_salt"))
-        if salt:
-            return base64.b64decode(salt)
+    legacy_state = read_json(path)
+    legacy_salt = (
+        _string_value(legacy_state.get("anonymization_salt"))
+        if legacy_state is not None
+        else None
+    )
+    if legacy_salt:
+        write_secret_section(
+            config_dir,
+            "privacy",
+            {"anonymization_salt": legacy_salt},
+        )
+        if read_secrets := secret_section(config_dir, "privacy"):
+            if read_secrets.get("anonymization_salt") == legacy_salt:
+                write_json_atomic(path, {"encrypted": True})
+                path.chmod(CONFIG_FILE_MODE)
+                return base64.b64decode(legacy_salt)
 
     salt_bytes = os.urandom(32)
-    write_json_atomic(
-        path,
+    write_secret_section(
+        config_dir,
+        "privacy",
         {"anonymization_salt": base64.b64encode(salt_bytes).decode("ascii")},
     )
+    write_json_atomic(path, {"encrypted": True})
     path.chmod(CONFIG_FILE_MODE)
     return salt_bytes
 
@@ -923,13 +1001,23 @@ def load_or_create_device_identity(config_dir: Path) -> DeviceIdentity:
     state = read_json(path)
     if state is not None:
         udid = _string_value(state.get("udid"))
-        display_name = _string_value(state.get("display_name")) or DEFAULT_DISPLAY_NAME
+        display_name = (
+            _string_value(state.get("display_name")) or default_display_name()
+        )
+        product_type = _string_value(state.get("product_type")) or APPLE_PRODUCT_TYPE
+        os_version = _string_value(state.get("os_version")) or APPLE_OS_VERSION
         if udid:
-            return DeviceIdentity(udid=udid, display_name=display_name)
+            return DeviceIdentity(
+                udid=udid,
+                display_name=display_name,
+                product_type=product_type,
+                os_version=os_version,
+            )
 
+    ensure_config_dir(config_dir)
     identity = DeviceIdentity(
         udid=uuid.uuid4().hex.upper(),
-        display_name=DEFAULT_DISPLAY_NAME,
+        display_name=default_display_name(),
     )
     write_json_atomic(
         path,
@@ -942,6 +1030,19 @@ def load_or_create_device_identity(config_dir: Path) -> DeviceIdentity:
     )
     path.chmod(CONFIG_FILE_MODE)
     return identity
+
+
+def default_display_name() -> str:
+    hostname = socket.gethostname().strip().split(".")[0]
+    if not hostname:
+        return "onitrack"
+    safe_hostname = "".join(
+        character if character.isalnum() or character in "-_" else "-"
+        for character in hostname
+    ).strip("-_")
+    if not safe_hostname:
+        return "onitrack"
+    return f"onitrack@{safe_hostname}"
 
 
 def _post_json(
@@ -996,6 +1097,20 @@ def _dict_path(data: dict[str, Any], *keys: str) -> dict[str, Any]:
 
 def _dict_value(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _merge_dicts(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(first)
+    for key, value in second.items():
+        if (
+            key in merged
+            and isinstance(merged[key], dict)
+            and isinstance(value, dict)
+        ):
+            merged[key] = _merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def _number_value(value: Any) -> float | int | None:

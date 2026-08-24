@@ -40,7 +40,22 @@ def build_parser() -> argparse.ArgumentParser:
     auth_subparsers = auth_parser.add_subparsers(dest="auth_command")
     auth_subparsers.add_parser("provision", help="interactively provision auth state")
     auth_subparsers.add_parser("status", help="show offline auth state status")
+    auth_subparsers.add_parser(
+        "upgrade",
+        help="prepare encrypted Apple registration state",
+    )
     auth_parser.set_defaults(_command_parser=auth_parser)
+
+    apple_parser = subparsers.add_parser("apple", help="manage Apple registration")
+    apple_parser.add_argument(
+        "--config-dir",
+        type=Path,
+        default=None,
+        help="config directory (default: .config/onitrack)",
+    )
+    apple_subparsers = apple_parser.add_subparsers(dest="apple_command")
+    apple_subparsers.add_parser("register", help="prepare encrypted APNs/IDS state")
+    apple_parser.set_defaults(_command_parser=apple_parser)
 
     people_parser = subparsers.add_parser("people", help="inspect Find My People")
     people_parser.add_argument(
@@ -131,15 +146,25 @@ def main(argv: list[str] | None = None) -> int:
             print("onitrack base environment available")
             return 0
         case "auth":
-            from onitrack.auth import print_status, provision
+            from onitrack.auth import print_status, provision, upgrade
 
             match args.auth_command:
                 case "provision":
                     return provision(resolve_config_dir(args.config_dir))
                 case "status":
                     return print_status(resolve_config_dir(args.config_dir))
+                case "upgrade":
+                    return upgrade(resolve_config_dir(args.config_dir))
                 case None:
                     args._command_parser.error("auth requires a subcommand")
+        case "apple":
+            from onitrack.auth import upgrade
+
+            match args.apple_command:
+                case "register":
+                    return upgrade(resolve_config_dir(args.config_dir))
+                case None:
+                    args._command_parser.error("apple requires a subcommand")
         case "people":
             from onitrack.people import (
                 get_people_location,

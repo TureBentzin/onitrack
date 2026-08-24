@@ -16,6 +16,7 @@ from onitrack.people import (
     anonymize_value,
     anonymized_relationships,
     decrypt_searchparty_location,
+    default_display_name,
     load_or_create_device_identity,
     parse_following,
     parse_location_plaintext,
@@ -31,6 +32,7 @@ from onitrack.state import (
     people_config_path,
     privacy_config_path,
     read_json,
+    read_secrets,
     write_json_atomic,
 )
 
@@ -53,6 +55,7 @@ def test_anonymized_output_contains_no_raw_handles_or_fmids(tmp_path):
     assert "handle_count" in output
     assert "handle_hashes" in output
     assert privacy_config_path(tmp_path).stat().st_mode & 0o777 == CONFIG_FILE_MODE
+    assert read_secrets(tmp_path)["privacy"]["anonymization_salt"]
 
 
 def test_anonymized_ids_are_stable_with_same_local_salt(tmp_path):
@@ -409,7 +412,10 @@ def test_non_logged_in_account_state_returns_clear_provisioning_error(
         "findmy",
         type("FindMy", (), {"AppleAccount": AppleAccount}),
     )
-    write_json_atomic(account_config_path(tmp_path), {"login": {"state": 0}})
+    write_json_atomic(
+        account_config_path(tmp_path),
+        {"login": {"state": 0, "data": {"dsid": "123"}}},
+    )
 
     assert (
         main(["people", "--config-dir", os.fspath(tmp_path), "list", "--anonomyse"])
@@ -597,8 +603,16 @@ def test_searchparty_decryption_fixture_and_apple_timestamp_conversion():
 def test_device_identity_is_persisted_with_private_mode(tmp_path):
     identity = load_or_create_device_identity(tmp_path)
 
-    assert identity.display_name == "Onitrack"
-    assert identity.product_type == "MacBookPro18,3"
+    assert identity.display_name.startswith("onitrack")
+    assert identity.product_type == "Macmini9,1"
     assert identity.os_version == "14.6"
     assert load_or_create_device_identity(tmp_path) == identity
     assert device_config_path(tmp_path).stat().st_mode & 0o777 == CONFIG_FILE_MODE
+
+
+def test_default_display_name_uses_hostname_and_falls_back_to_onitrack(monkeypatch):
+    monkeypatch.setattr("socket.gethostname", lambda: "workstation.example.com")
+    assert default_display_name() == "onitrack@workstation"
+
+    monkeypatch.setattr("socket.gethostname", lambda: "")
+    assert default_display_name() == "onitrack"
