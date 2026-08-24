@@ -7,6 +7,16 @@
       packaged = import ./packages.nix {
         inherit pkgs projectName;
       };
+      devPython = packaged.python.withPackages (
+        ps:
+        [
+          packaged.findmy
+          ps.build
+          ps.mypy
+          ps.pytest
+          ps.ruff
+        ]
+      );
     in
     {
       packages = {
@@ -43,16 +53,14 @@
         name = "${projectName}-devshell";
 
         packages = [
-          packaged.python
-          packaged.pythonPackages.pytest
-          packaged.pythonPackages.ruff
-          packaged.pythonPackages.mypy
-          packaged.pythonPackages.build
+          devPython
           pkgs.curl
           pkgs.git
           pkgs.jq
           pkgs.nixfmt
         ];
+
+        ONITRACK_ANISETTE_LIBS_TEMPLATE = "${packaged.anisetteLibs}";
       };
     };
 }

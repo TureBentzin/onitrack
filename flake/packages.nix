@@ -186,6 +186,8 @@ let
 in
 {
   inherit
+    anisetteLibs
+    findmy
     onitrack
     python
     pythonPackages
