@@ -40,6 +40,32 @@ def build_parser() -> argparse.ArgumentParser:
     auth_subparsers = auth_parser.add_subparsers(dest="auth_command")
     auth_subparsers.add_parser("provision", help="interactively provision auth state")
     auth_subparsers.add_parser("status", help="show offline auth state status")
+    auth_parser.set_defaults(_command_parser=auth_parser)
+
+    people_parser = subparsers.add_parser("people", help="inspect Find My People")
+    people_parser.add_argument(
+        "--config-dir",
+        type=Path,
+        default=None,
+        help="config directory (default: .config/onitrack)",
+    )
+    people_subparsers = people_parser.add_subparsers(dest="people_command")
+    people_list_parser = people_subparsers.add_parser(
+        "list",
+        help="list accepted People location shares",
+    )
+    people_list_parser.add_argument(
+        "--anonomyse",
+        action="store_true",
+        help="print anonymized relationship identifiers",
+    )
+    people_list_parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="print raw relationship identifiers",
+    )
+    people_parser.set_defaults(_command_parser=people_parser)
+    people_list_parser.set_defaults(_command_parser=people_list_parser)
 
     return parser
 
@@ -64,7 +90,24 @@ def main(argv: list[str] | None = None) -> int:
                 case "status":
                     return print_status(resolve_config_dir(args.config_dir))
                 case None:
-                    parser.error("auth requires a subcommand")
+                    args._command_parser.error("auth requires a subcommand")
+        case "people":
+            from onitrack.people import list_people
+
+            match args.people_command:
+                case "list":
+                    if not args.anonomyse and not args.plain:
+                        args._command_parser.error("choose --anonomyse or --plain")
+                    if args.anonomyse and args.plain:
+                        args._command_parser.error(
+                            "choose only one of --anonomyse or --plain",
+                        )
+                    return list_people(
+                        resolve_config_dir(args.config_dir),
+                        anonymise=args.anonomyse,
+                    )
+                case None:
+                    args._command_parser.error("people requires a subcommand")
         case None:
             parser.print_help()
             return 0

@@ -9,6 +9,8 @@ CONFIG_DIR_ENV = "ONITRACK_CONFIG_DIR"
 CONFIG_DIR_MODE = 0o700
 CONFIG_FILE_MODE = 0o600
 ACCOUNT_CONFIG_FILE = "account.json"
+DEVICE_CONFIG_FILE = "device.json"
+PRIVACY_CONFIG_FILE = "privacy.json"
 
 
 def default_config_dir() -> Path:
@@ -30,6 +32,14 @@ def ensure_config_dir(path: Path) -> Path:
 
 def account_config_path(config_dir: Path) -> Path:
     return config_dir / ACCOUNT_CONFIG_FILE
+
+
+def device_config_path(config_dir: Path) -> Path:
+    return config_dir / DEVICE_CONFIG_FILE
+
+
+def privacy_config_path(config_dir: Path) -> Path:
+    return config_dir / PRIVACY_CONFIG_FILE
 
 
 def read_json(path: Path) -> dict[str, Any] | None:
