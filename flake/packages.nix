@@ -148,6 +148,42 @@ let
     doCheck = false;
   };
 
+  pypush = pythonPackages.buildPythonPackage rec {
+    pname = "pypush";
+    version = "2.0.0.dev20260314";
+    pyproject = true;
+
+    src = pkgs.fetchFromGitHub {
+      owner = "JJTech0130";
+      repo = "pypush";
+      rev = "71aa2e4442061596f75e6b02dfad613330127b5b";
+      hash = "sha256-RqLEMFK8dkr61Tfyo11o7f+RlDOYoyw2bSHNp58IJpA=";
+    };
+
+    build-system = with pythonPackages; [
+      setuptools
+      setuptools-scm
+    ];
+
+    dependencies = with pythonPackages; [
+      anyio
+      cryptography
+      exceptiongroup
+      h2
+      httpx
+      importlib-metadata
+      typing-extensions
+    ];
+
+    SETUPTOOLS_SCM_PRETEND_VERSION = version;
+
+    pythonImportsCheck = [
+      "pypush"
+    ];
+
+    doCheck = false;
+  };
+
   onitrack = pythonPackages.buildPythonApplication {
     pname = projectName;
     version = "0.1.0";
@@ -161,6 +197,7 @@ let
 
     dependencies = [
       findmy
+      pypush
     ];
 
     nativeCheckInputs = [
@@ -194,6 +231,7 @@ in
     anisetteLibs
     findmy
     onitrack
+    pypush
     python
     pythonPackages
     ;

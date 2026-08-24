@@ -11,6 +11,7 @@
         ps:
         [
           packaged.findmy
+          packaged.pypush
           ps.build
           ps.mypy
           ps.pytest

@@ -54,8 +54,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="config directory (default: .config/onitrack)",
     )
     apple_subparsers = apple_parser.add_subparsers(dest="apple_command")
-    apple_subparsers.add_parser("register", help="prepare encrypted APNs/IDS state")
+    apple_register_parser = apple_subparsers.add_parser(
+        "register",
+        help="register APNs/IDS state",
+    )
+    apple_register_parser.add_argument(
+        "--debug-redacted",
+        action="store_true",
+        help="allow redacted helper diagnostics",
+    )
     apple_parser.set_defaults(_command_parser=apple_parser)
+    apple_register_parser.set_defaults(_command_parser=apple_register_parser)
 
     people_parser = subparsers.add_parser("people", help="inspect Find My People")
     people_parser.add_argument(
@@ -158,11 +167,14 @@ def main(argv: list[str] | None = None) -> int:
                 case None:
                     args._command_parser.error("auth requires a subcommand")
         case "apple":
-            from onitrack.auth import upgrade
+            from onitrack.apple import register
 
             match args.apple_command:
                 case "register":
-                    return upgrade(resolve_config_dir(args.config_dir))
+                    return register(
+                        resolve_config_dir(args.config_dir),
+                        debug_redacted=args.debug_redacted,
+                    )
                 case None:
                     args._command_parser.error("apple requires a subcommand")
         case "people":

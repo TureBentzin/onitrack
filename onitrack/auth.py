@@ -77,27 +77,9 @@ def print_status(config_dir: Path) -> int:
 
 
 def upgrade(config_dir: Path) -> int:
-    try:
-        migrate_legacy_secrets(config_dir)
-        from onitrack.people import load_or_create_device_identity
+    from onitrack.apple import register
 
-        device = load_or_create_device_identity(config_dir)
-    except SecretStoreError as exc:
-        print(f"auth: secret_store_error: {exc}")
-        return 1
-
-    people = secret_section(config_dir, "people")
-    has_apns = bool(_dict_value(people.get("apns")).get("courier_token"))
-    has_ids = bool(_dict_value(people.get("ids")))
-    status = "registered" if has_apns and has_ids else "upgrade_required"
-    print(f"apple: {status}")
-    print(f"device: {device.display_name} {device.product_type}")
-    if status != "registered":
-        print(
-            "apple: APNs/IDS live registration is not available in this build; "
-            "encrypted state is ready",
-        )
-    return 0
+    return register(config_dir, debug_redacted=False)
 
 
 def _load_or_create_account(account_path: Path, config_dir: Path) -> Any:
