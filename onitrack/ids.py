@@ -15,7 +15,7 @@ from urllib import error, request
 from urllib.parse import urlparse
 
 IDS_BAG_URL = "https://init.ess.apple.com/WebObjects/VCInit.woa/wa/getBag?ix=3"
-IDS_PROTOCOL_VERSION = "1750"
+IDS_PROTOCOL_VERSION = "1660"
 MULTIPLEX_SERVICE = "com.apple.private.alloy.multiplex1"
 MULTIPLEX_SUB_SERVICES = (
     "com.apple.private.alloy.fmf",
@@ -78,7 +78,8 @@ def register_ids(
     state = dict(existing)
     identity = _load_or_create_identity(_dict_value(state.get("identity")))
     state["identity"] = identity.export_state()
-    ids_device = _nac_device(device)
+    ids_device = _registration_device(device, state)
+    validation_data = _registration_validation_data(state)
 
     delegate = _login_ids_delegate(
         username=username,
@@ -86,7 +87,7 @@ def register_ids(
         adsid=adsid,
         anisette_headers=anisette_headers,
         device=ids_device,
-        validation_data=_generate_validation_data(),
+        validation_data=validation_data,
     )
     user_id = _string_value(delegate.get("profile-id"))
     auth_token = _string_value(delegate.get("auth-token"))
@@ -112,7 +113,7 @@ def register_ids(
         push_cert=push_cert,
         push_key=push_key,
         device=ids_device,
-        validation_data=_generate_validation_data(),
+        validation_data=validation_data,
     )
     state["users"] = {
         user_id: {
@@ -127,7 +128,7 @@ def register_ids(
     state["device_profile"] = {
         "display_name": device.display_name,
         "product_type": ids_device.product_type,
-        "source": "pypush-emulated-nac",
+        "source": getattr(ids_device, "source", "pypush-emulated-nac"),
     }
 
     sanitized_account = _drop_idms_pet(account_state)
@@ -286,13 +287,15 @@ def _authenticate_ds_id(user_id: str, auth_token: str, device: Any) -> _AuthKeyP
                 "csr": csr_der,
                 "realm-user-id": user_id,
             },
-            fmt=plistlib.FMT_BINARY,
+            fmt=plistlib.FMT_XML,
         ),
+        mtime=0,
     )
     response = _request_plist(
         _bag("id-authenticate-ds-id"),
         headers={
             "Content-Encoding": "gzip",
+            "Content-Type": "application/x-apple-plist",
             "User-Agent": f"com.apple.invitation-registration {_version_ua(device)}",
             "x-protocol-version": IDS_PROTOCOL_VERSION,
         },
@@ -300,7 +303,10 @@ def _authenticate_ds_id(user_id: str, auth_token: str, device: Any) -> _AuthKeyP
     )
     status = int(response.get("status", 1))
     if status != 0:
-        raise IDSRegistrationError(f"IDS auth certificate request failed: {status}")
+        raise IDSRegistrationError(
+            f"IDS auth certificate request failed: {status} "
+            f"{_redacted_plist_summary(response)}",
+        )
     cert = response.get("cert")
     if not isinstance(cert, bytes):
         raise IDSRegistrationError("IDS auth certificate response is missing cert")
@@ -646,21 +652,40 @@ def _signature_payload(nonce: bytes, fields: list[bytes]) -> bytes:
 
 
 def _generate_auth_csr(user_id: str) -> tuple[Any, bytes]:
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     common_name = hashlib.sha1(user_id.encode()).hexdigest().upper()
-    csr = (
-        x509.CertificateSigningRequestBuilder()
-        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)]))
-        .sign(key, hashes.SHA256())
+    subject = _der_sequence(
+        _der_set(
+            _der_sequence(
+                _der_oid("2.5.4.3"),
+                _der_utf8_string(common_name),
+            ),
+        ),
     )
-    from cryptography.hazmat.primitives import serialization
+    public_key_info = key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    request_info = _der_sequence(
+        _der_integer(0),
+        subject,
+        public_key_info,
+        _der_context_constructed(0, b""),
+    )
+    signature = key.sign(request_info, padding.PKCS1v15(), hashes.SHA1())
+    csr = _der_sequence(
+        request_info,
+        _der_sequence(
+            _der_oid("1.2.840.113549.1.1.5"),
+            _der_null(),
+        ),
+        _der_bit_string(signature),
+    )
 
-    return key, csr.public_bytes(serialization.Encoding.DER)
+    return key, csr
 
 
 def _load_or_create_identity(state: dict[str, Any]) -> _IDSIdentity:
@@ -750,14 +775,17 @@ def _load_certificate_der(state: dict[str, Any], key: str) -> bytes:
     )
 
 
-def _validation_data(state: dict[str, Any]) -> bytes:
-    encoded = _string_value(state.get("validation_data"))
-    if not encoded:
-        return b""
+def _registration_validation_data(state: dict[str, Any]) -> bytes:
+    external = _dict_value(state.get("external_validation"))
+    encoded = _string_value(external.get("validation_data"))
+    if encoded is None:
+        return _generate_validation_data()
     try:
         return base64.b64decode(encoded, validate=True)
     except ValueError as exc:
-        raise IDSRegistrationError("stored IDS validation data is malformed") from exc
+        raise IDSRegistrationError(
+            "stored IDS external validation data is malformed",
+        ) from exc
 
 
 def _generate_validation_data() -> bytes:
@@ -783,10 +811,30 @@ def _generate_validation_data() -> bytes:
 def _nac_device(device: Any) -> Any:
     return SimpleNamespace(
         display_name=device.display_name,
+        os_build=_macos_build(NAC_OS_VERSION),
         os_version=NAC_OS_VERSION,
         product_type=NAC_PRODUCT_TYPE,
+        source="pypush-emulated-nac",
         udid=device.udid,
     )
+
+
+def _registration_device(device: Any, state: dict[str, Any]) -> Any:
+    external = _dict_value(state.get("external_validation"))
+    device_info = _dict_value(external.get("device_info"))
+    product_type = _string_value(device_info.get("hardware_version"))
+    os_version = _string_value(device_info.get("software_version"))
+    os_build = _string_value(device_info.get("software_build_id"))
+    if product_type and os_version and os_build:
+        return SimpleNamespace(
+            display_name=device.display_name,
+            os_build=os_build,
+            os_version=os_version,
+            product_type=product_type,
+            source="mac-registration-provider",
+            udid=_string_value(device_info.get("unique_device_id")) or device.udid,
+        )
+    return _nac_device(device)
 
 
 def _private_device_data(device: Any) -> dict[str, Any]:
@@ -798,7 +846,7 @@ def _private_device_data(device: Any) -> dict[str, Any]:
         "h": "1",
         "m": "0",
         "p": "0",
-        "pb": _macos_build(device.os_version),
+        "pb": _device_build(device),
         "pn": "macOS",
         "pv": device.os_version,
         "s": "0",
@@ -811,20 +859,29 @@ def _private_device_data(device: Any) -> dict[str, Any]:
 def _mme_client_info(device: Any) -> str:
     return (
         f"<{device.product_type}> <macOS;{device.os_version};"
-        f"{_macos_build(device.os_version)}> "
+        f"{_device_build(device)}> "
         "<com.apple.AOSKit/282 (com.apple.accountsd/113)>"
     )
 
 
 def _version_ua(device: Any) -> str:
     return (
-        f"[macOS,{device.os_version},{_macos_build(device.os_version)},"
+        f"[macOS,{device.os_version},{_device_build(device)},"
         f"{device.product_type}]"
     )
 
 
+def _device_build(device: Any) -> str:
+    return _string_value(getattr(device, "os_build", None)) or _macos_build(
+        device.os_version,
+    )
+
+
 def _macos_build(version: str) -> str:
-    return {"14.6": "23G80"}.get(version, "23G80")
+    return {
+        "13.6.4": "22G513",
+        "14.6": "23G80",
+    }.get(version, "23G80")
 
 
 def _drop_idms_pet(account_state: dict[str, Any]) -> dict[str, Any]:
@@ -890,8 +947,64 @@ def _der_sequence(*children: bytes) -> bytes:
     return b"\x30" + _der_len(len(payload)) + payload
 
 
+def _der_set(*children: bytes) -> bytes:
+    payload = b"".join(children)
+    return b"\x31" + _der_len(len(payload)) + payload
+
+
+def _der_integer(value: int) -> bytes:
+    if value == 0:
+        payload = b"\x00"
+    else:
+        payload = value.to_bytes((value.bit_length() + 7) // 8, "big")
+        if payload[0] & 0x80:
+            payload = b"\x00" + payload
+    return b"\x02" + _der_len(len(payload)) + payload
+
+
+def _der_oid(value: str) -> bytes:
+    parts = [int(part) for part in value.split(".")]
+    if len(parts) < 2:
+        raise ValueError("OID must have at least two arcs")
+    encoded = bytes([parts[0] * 40 + parts[1]])
+    for part in parts[2:]:
+        encoded += _base128(part)
+    return b"\x06" + _der_len(len(encoded)) + encoded
+
+
+def _der_utf8_string(value: str) -> bytes:
+    encoded = value.encode("utf-8")
+    return b"\x0c" + _der_len(len(encoded)) + encoded
+
+
+def _der_null() -> bytes:
+    return b"\x05\x00"
+
+
+def _der_bit_string(value: bytes) -> bytes:
+    payload = b"\x00" + value
+    return b"\x03" + _der_len(len(payload)) + payload
+
+
+def _der_context_constructed(tag: int, payload: bytes) -> bytes:
+    return bytes([0xA0 | tag]) + _der_len(len(payload)) + payload
+
+
 def _der_context_primitive(tag: int, payload: bytes) -> bytes:
     return bytes([0x80 | tag]) + _der_len(len(payload)) + payload
+
+
+def _base128(value: int) -> bytes:
+    if value == 0:
+        return b"\x00"
+    parts = []
+    while value:
+        parts.append(value & 0x7F)
+        value >>= 7
+    encoded = bytearray()
+    for index, part in enumerate(reversed(parts)):
+        encoded.append(part | (0x80 if index < len(parts) - 1 else 0))
+    return bytes(encoded)
 
 
 def _proto_varint(field: int, value: int) -> bytes:

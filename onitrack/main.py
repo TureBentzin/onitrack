@@ -71,6 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="allow redacted helper diagnostics",
     )
+    apple_register_parser.add_argument(
+        "--validation-json",
+        default=None,
+        help="mac-registration-provider -once JSON path, or '-' for stdin",
+    )
     apple_parser.set_defaults(_command_parser=apple_parser)
     apple_register_parser.set_defaults(_command_parser=apple_register_parser)
 
@@ -205,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
                     return register(
                         resolve_config_dir(args.config_dir),
                         debug_redacted=args.debug_redacted,
+                        validation_json=args.validation_json,
                     )
                 case None:
                     args._command_parser.error("apple requires a subcommand")

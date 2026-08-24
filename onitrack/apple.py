@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
+import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -27,9 +30,18 @@ class AppleRegistrationError(RuntimeError):
     pass
 
 
-def register(config_dir: Path, *, debug_redacted: bool = False) -> int:
+def register(
+    config_dir: Path,
+    *,
+    debug_redacted: bool = False,
+    validation_json: str | None = None,
+) -> int:
     try:
-        result = register_state(config_dir, debug_redacted=debug_redacted)
+        result = register_state(
+            config_dir,
+            debug_redacted=debug_redacted,
+            validation_json=validation_json,
+        )
     except SecretStoreError as exc:
         print(f"apple: secret_store_error: {exc}")
         return 1
@@ -42,7 +54,12 @@ def register(config_dir: Path, *, debug_redacted: bool = False) -> int:
     return 0
 
 
-def register_state(config_dir: Path, *, debug_redacted: bool = False) -> dict[str, Any]:
+def register_state(
+    config_dir: Path,
+    *,
+    debug_redacted: bool = False,
+    validation_json: str | None = None,
+) -> dict[str, Any]:
     migrate_legacy_secrets(config_dir)
     account = secret_section(config_dir, "account")
     if not account:
@@ -50,6 +67,12 @@ def register_state(config_dir: Path, *, debug_redacted: bool = False) -> dict[st
 
     device = load_or_create_device_identity(config_dir)
     people = secret_section(config_dir, "people")
+    if validation_json is not None:
+        people = _merge_dicts(
+            people,
+            {"ids": {"external_validation": _load_validation_json(validation_json)}},
+        )
+        write_secret_section(config_dir, "people", people)
     if _registered(people):
         return {
             "status": "registered",
@@ -204,6 +227,53 @@ def _bytes_from_hex(value: str | None) -> bytes | None:
         return bytes.fromhex(value)
     except ValueError as exc:
         raise AppleRegistrationError("stored APNs token is malformed") from exc
+
+
+def _load_validation_json(path: str) -> dict[str, Any]:
+    try:
+        raw = (
+            sys.stdin.read()
+            if path == "-"
+            else Path(path).read_text(encoding="utf-8")
+        )
+        data = json.loads(raw)
+    except OSError as exc:
+        raise AppleRegistrationError(f"failed to read validation JSON: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise AppleRegistrationError("validation JSON is malformed") from exc
+    if not isinstance(data, dict):
+        raise AppleRegistrationError("validation JSON must be an object")
+
+    validation_data = _string_value(data.get("validation_data"))
+    if validation_data is None:
+        raise AppleRegistrationError("validation JSON is missing validation_data")
+    try:
+        base64.b64decode(validation_data, validate=True)
+    except ValueError as exc:
+        raise AppleRegistrationError("validation_data must be base64") from exc
+
+    device_info = _dict_value(data.get("device_info"))
+    required_device_fields = (
+        "hardware_version",
+        "software_version",
+        "software_build_id",
+    )
+    missing = [
+        field
+        for field in required_device_fields
+        if _string_value(device_info.get(field)) is None
+    ]
+    if missing:
+        raise AppleRegistrationError(
+            "validation JSON is missing device_info fields: " + ", ".join(missing),
+        )
+
+    return {
+        "device_info": device_info,
+        "source": "mac-registration-provider",
+        "valid_until": _string_value(data.get("valid_until")),
+        "validation_data": validation_data,
+    }
 
 
 async def _maybe_await(value: Any) -> Any:

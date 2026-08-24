@@ -72,6 +72,73 @@ def test_apple_register_persists_native_ids_state(
     assert capsys.readouterr().out == ""
 
 
+def test_apple_register_imports_external_validation_json(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+
+    def fake_register_ids(**kwargs):
+        captured.update(kwargs)
+        return IDSRegistrationResult(
+            ids_state={"registered": True},
+            account_state={"account": {"username": "person@example.com"}},
+        )
+
+    monkeypatch.setattr("onitrack.apple._anisette_headers", lambda *args: {})
+    monkeypatch.setattr("onitrack.apple.register_ids", fake_register_ids)
+    write_secret_section(
+        tmp_path,
+        "account",
+        {"account": {"username": "person@example.com"}, "login": {"state": 3}},
+    )
+    write_secret_section(
+        tmp_path,
+        "people",
+        {
+            "apns": {
+                "certificate_pem": "cert",
+                "courier_token": "00",
+                "private_key_pem": "key",
+                "scoped_tokens": {
+                    "com.apple.private.ids": "01",
+                    "com.apple.private.alloy.fmf": "02",
+                    "com.apple.private.alloy.fmd": "03",
+                    "com.apple.private.alloy.multiplex1": "04",
+                },
+            },
+        },
+    )
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(
+        json.dumps(
+            {
+                "validation_data": "dmFsaWRhdGlvbg==",
+                "valid_until": "2026-08-24T12:00:00Z",
+                "device_info": {
+                    "hardware_version": "Mac14,3",
+                    "software_version": "14.3",
+                    "software_build_id": "23D56",
+                },
+            },
+        ),
+        encoding="utf-8",
+    )
+
+    result = register_state(
+        tmp_path,
+        debug_redacted=True,
+        validation_json=os.fspath(validation_path),
+    )
+
+    assert result["status"] == "registered"
+    external = captured["existing"]["external_validation"]
+    assert external["validation_data"] == "dmFsaWRhdGlvbg=="
+    assert external["device_info"]["hardware_version"] == "Mac14,3"
+    secrets = read_secrets(tmp_path)
+    assert secrets["people"]["ids"]["registered"] is True
+
+
 def test_apple_register_ids_error_returns_clear_error(
     monkeypatch,
     tmp_path,
