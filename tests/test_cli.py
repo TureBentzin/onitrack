@@ -28,6 +28,15 @@ def test_auth_provision_accepts_refresh_help(capsys):
     assert "--validation-json" in output
 
 
+def test_apple_register_accepts_explicit_device_replacement_help(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["apple", "register", "--help"])
+
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    assert "--replace-device-registration" in output
+
+
 def test_people_list_requires_output_mode(capsys):
     with pytest.raises(SystemExit) as exc:
         main(["people", "list"])

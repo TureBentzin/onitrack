@@ -475,25 +475,37 @@ class _FMFSession:
         *,
         selected_fm_id: str | None = None,
     ) -> dict[str, Any]:
+        from onitrack.ids import _device_build
+
         headers = dict(self.account.get_anisette_headers(with_client_info=True))
         headers.update(
             {
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "findmylocated/1 CFNetwork/1496.0.7 Darwin/23.5.0",
+                "User-Agent": "FMFD/1.0",
                 "X-FMF-Model-Version": FMF_MODEL_VERSION,
             },
         )
         client_context = {
-            "appName": "findmylocated",
+            "appName": "fmfd",
+            "appVersion": "7.0",
             "apsToken": self.aps_token,
-            "callerHandleId": self.caller,
-            "contextBundleApp": FINDMYLOCATED_BUNDLE,
-            "currentTime": int(time.time() * 1000),
-            "deviceUDID": self.device.udid,
-            "deviceDisplayName": self.device.display_name,
-            "productType": self.device.product_type,
+            "buildVersion": _device_build(self.device),
+            "countryCode": "US",
+            "currentTime": time.time(),
+            "deviceClass": "Mac",
+            "deviceHasPasscode": True,
+            "deviceUDID": self.device.udid.lower(),
+            "fencingEnabled": True,
+            "isFMFAppRemoved": False,
             "osVersion": self.device.os_version,
+            "platform": "macosx",
+            "processId": str(os.getpid()),
+            "productType": self.device.product_type,
+            "regionCode": "US",
+            "signedInAs": self.caller,
+            "timezone": "UTC, 0",
+            "unlockState": 0,
         }
         if selected_fm_id is not None:
             client_context["selectedFriend"] = selected_fm_id
@@ -652,15 +664,17 @@ class PeopleClient:
                 people_state=people_state,
                 user_agent=_version_ua(registered_device),
                 debug_emit=self.debug_logger.emit,
+                receiver_preflight=self.debug_logger.enabled,
             )
 
             def prepare_delivery(base_token: bytes) -> PersonRelationship:
+                aps_token = base_token.hex().upper()
                 session = _FMFSession(
                     account=account,
                     state=state,
                     device=registered_device,
                     debug_logger=self.debug_logger,
-                    aps_token=base_token.hex(),
+                    aps_token=aps_token,
                 )
                 response = session.initialize()
                 relationship = relationship_for_person_id(
@@ -680,7 +694,7 @@ class PeopleClient:
                     registered_device,
                     relationship.fm_id,
                     None,
-                    base_token.hex(),
+                    aps_token,
                     intent="distributeKeys",
                     mode="proactive",
                 )
@@ -824,6 +838,7 @@ class PeopleClient:
                     device.product_type == APPLE_FALLBACK_PRODUCT_TYPE
                 ),
                 "response_keys": sorted(response),
+                "apple_status_code": _safe_integer(response.get("statusCode")),
                 "location_payload_count": len(payload)
                 if isinstance(payload, list)
                 else 0,
@@ -1462,6 +1477,16 @@ def _string_value(value: Any) -> str | None:
 
 def _optional_bool(value: Any) -> bool | None:
     return value if isinstance(value, bool) else None
+
+
+def _safe_integer(value: Any) -> int | str:
+    if isinstance(value, bool):
+        return "unknown"
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return "unknown"
 
 
 def _base64_text(value: str) -> str:

@@ -83,7 +83,7 @@ class IDSDirectoryClient:
     ) -> DirectoryIdentity:
         user = _registered_user_for_target(self.ids_state, target)
         body = gzip.compress(
-            plistlib.dumps({"uris": [sender]}, fmt=plistlib.FMT_BINARY),
+            plistlib.dumps({"uris": [sender]}, fmt=plistlib.FMT_XML),
             mtime=0,
         )
         headers = {
@@ -93,6 +93,7 @@ class IDSDirectoryClient:
             "x-id-sub-service": topic,
             "x-protocol-version": IDS_PROTOCOL_VERSION,
             "x-push-token": base64.b64encode(base_token).decode("ascii"),
+            "x-required-for-message": "true",
             "x-result-expected": "true",
         }
         registration = _dict_value(user.get("registration"))
@@ -188,6 +189,7 @@ class PeopleKeyAcquirer:
         user_agent: str,
         debug_emit: Callable[[str, dict[str, Any]], None] | None = None,
         connection_factory: Callable[..., Any] | None = None,
+        receiver_preflight: bool = False,
     ) -> None:
         self.people_state = people_state
         self.ids_state = _dict_value(people_state.get("ids"))
@@ -198,6 +200,7 @@ class PeopleKeyAcquirer:
         )
         self.debug_emit = debug_emit or (lambda _step, _fields: None)
         self.connection_factory = connection_factory
+        self.receiver_preflight = receiver_preflight
 
     async def acquire(
         self,
@@ -224,6 +227,10 @@ class PeopleKeyAcquirer:
         ) as connection:
             try:
                 base_token = await connection.base_token
+                token_changed = not hmac.compare_digest(base_token, stored_token)
+                await _set_apns_active(connection)
+                if self.receiver_preflight:
+                    await self._run_receiver_preflight(connection, base_token)
                 async with AsyncExitStack() as stack:
                     streams: dict[str, Any] = {}
                     for topic in APNS_INTEREST_TOPICS:
@@ -235,6 +242,7 @@ class PeopleKeyAcquirer:
                         {
                             "topic_count": len(streams),
                             "apns_token": base_token.hex(),
+                            "token_changed": token_changed,
                         },
                     )
                     relationship = await asyncio.to_thread(
@@ -264,6 +272,32 @@ class PeopleKeyAcquirer:
             raise KeyAcquisitionError("key acquisition ended without a result")
         return result
 
+    async def _run_receiver_preflight(
+        self,
+        connection: Any,
+        base_token: bytes,
+    ) -> None:
+        try:
+            target = _registered_self_handle(self.ids_state)
+            await asyncio.wait_for(
+                self.directory.query_sender(
+                    connection,
+                    base_token=base_token,
+                    topic=MULTIPLEX_SUB_SERVICES[0],
+                    sender=target,
+                    target=target,
+                    sender_token=base_token,
+                ),
+                timeout=10,
+            )
+        except (KeyAcquisitionError, TimeoutError) as exc:
+            self.debug_emit(
+                "ids_receiver_preflight",
+                {"status": "failed", "category": str(exc)},
+            )
+            return
+        self.debug_emit("ids_receiver_preflight", {"status": "ready"})
+
     async def _wait_for_delivery(
         self,
         connection: Any,
@@ -276,6 +310,7 @@ class PeopleKeyAcquirer:
     ) -> VerifiedKeyDelivery:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wait_seconds
+        notification_counts = {topic: 0 for topic in streams}
         tasks = {
             asyncio.create_task(stream.receive()): topic
             for topic, stream in streams.items()
@@ -284,27 +319,46 @@ class PeopleKeyAcquirer:
             while tasks:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
-                    raise KeyAcquisitionTimeout(
-                        "key delivery timed out; the sharing device may be offline",
-                    )
+                    self._raise_timeout(notification_counts)
                 done, _pending = await asyncio.wait(
                     tasks,
                     timeout=remaining,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if not done:
-                    raise KeyAcquisitionTimeout(
-                        "key delivery timed out; the sharing device may be offline",
-                    )
+                    self._raise_timeout(notification_counts)
                 for task in done:
                     topic = tasks.pop(task)
                     command = task.result()
                     tasks[asyncio.create_task(streams[topic].receive())] = topic
-                    if topic not in KEY_DELIVERY_TOPICS:
-                        continue
+                    notification_counts[topic] += 1
+                    payload_size = (
+                        len(command.payload)
+                        if isinstance(command.payload, bytes)
+                        else None
+                    )
+                    envelope: dict[str, Any] | None = None
                     try:
                         envelope = _load_plist(command.payload, "IDS message")
                     except KeyAcquisitionError:
+                        pass
+                    message_command = (
+                        envelope.get("c") if envelope is not None else None
+                    )
+                    self.debug_emit(
+                        "apns_notification_received",
+                        {
+                            "topic": topic,
+                            "command": message_command
+                            if isinstance(message_command, int)
+                            else "unknown",
+                            "payload_size": payload_size,
+                            "plist": envelope is not None,
+                        },
+                    )
+                    if topic not in KEY_DELIVERY_TOPICS:
+                        continue
+                    if envelope is None:
                         continue
                     if envelope.get("c") != 242:
                         continue
@@ -346,6 +400,21 @@ class PeopleKeyAcquirer:
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _raise_timeout(self, notification_counts: dict[str, int]) -> None:
+        active_topics = {
+            topic: count for topic, count in notification_counts.items() if count
+        }
+        self.debug_emit(
+            "people_key_delivery_timeout",
+            {
+                "notification_count": sum(notification_counts.values()),
+                "active_topics": active_topics,
+            },
+        )
+        raise KeyAcquisitionTimeout(
+            "key delivery timed out; the sharing device may be offline",
+        )
 
 
 async def verify_key_delivery(
@@ -586,6 +655,16 @@ async def _send_plist(
     await connection._send(command)
 
 
+async def _set_apns_active(connection: Any) -> None:
+    try:
+        from pypush.apns.protocol import SetStateCommand
+    except ImportError as exc:
+        raise KeyAcquisitionError("pypush is required for APNs") from exc
+    await connection._send(
+        SetStateCommand(state=1, unknown2=0x7FFFFFFF),
+    )
+
+
 def _load_apns_material(state: dict[str, Any]) -> tuple[Any, Any, bytes]:
     try:
         from cryptography import x509
@@ -625,6 +704,20 @@ def _registered_user_for_target(
     if len(matches) != 1:
         raise KeyAcquisitionError("IDS target does not match one registered identity")
     return matches[0]
+
+
+def _registered_self_handle(ids_state: dict[str, Any]) -> str:
+    users = _dict_value(ids_state.get("users"))
+    handles = {
+        handle
+        for user in users.values()
+        if isinstance(user, dict)
+        for handle in user.get("handles", [])
+        if isinstance(handle, str) and handle
+    }
+    if not handles:
+        raise KeyAcquisitionError("IDS registration has no receiver handle")
+    return sorted(handles)[0]
 
 
 def _parse_prekey_data(value: bytes) -> tuple[bytes, bytes, bytes]:
@@ -713,13 +806,20 @@ def _p256_public_from_x(value: bytes) -> Any:
         raise KeyAcquisitionError("compact P-256 key is malformed")
     from cryptography.hazmat.primitives.asymmetric import ec
 
-    try:
-        return ec.EllipticCurvePublicKey.from_encoded_point(
-            ec.SECP256R1(),
-            b"\x02" + value,
-        )
-    except ValueError as exc:
-        raise KeyAcquisitionError("compact P-256 key is invalid") from exc
+    candidates = []
+    for prefix in (b"\x02", b"\x03"):
+        try:
+            candidates.append(
+                ec.EllipticCurvePublicKey.from_encoded_point(
+                    ec.SECP256R1(),
+                    prefix + value,
+                ),
+            )
+        except ValueError:
+            continue
+    if not candidates:
+        raise KeyAcquisitionError("compact P-256 key is invalid")
+    return min(candidates, key=lambda key: key.public_numbers().y)
 
 
 def _verify_raw_ecdsa(key: Any, signature: bytes, data: bytes, label: str) -> None:
@@ -769,7 +869,7 @@ def _load_ec_private_key(value: Any, label: str) -> Any:
 def _load_plist(value: bytes, label: str) -> dict[str, Any]:
     try:
         decoded = plistlib.loads(value)
-    except (plistlib.InvalidFileException, ValueError) as exc:
+    except (plistlib.InvalidFileException, TypeError, ValueError) as exc:
         raise KeyAcquisitionError(f"{label} plist is malformed") from exc
     if not isinstance(decoded, dict):
         raise KeyAcquisitionError(f"{label} plist root is not a dictionary")

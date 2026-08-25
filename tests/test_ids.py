@@ -209,6 +209,35 @@ def test_external_validation_selects_real_mac_device_tuple():
     assert _registration_validation_data(state) == b"validation"
 
 
+def test_external_validation_can_use_onitrack_device_uuid():
+    state = {
+        "uses_local_udid": True,
+        "external_validation": {
+            "device_info": {
+                "hardware_version": "Mac14,3",
+                "software_version": "14.3",
+                "software_build_id": "23D56",
+                "unique_device_id": "REAL-UUID",
+            },
+        },
+    }
+    device = _registration_device(
+        type(
+            "Device",
+            (),
+            {
+                "display_name": "onitrack@host",
+                "os_version": "14.6",
+                "product_type": "Macmini9,1",
+                "udid": "ONITRACK-UUID",
+            },
+        )(),
+        state,
+    )
+
+    assert device.udid == "ONITRACK-UUID"
+
+
 def test_id_register_uses_xml_and_external_build_tuple(monkeypatch):
     captured = {}
 

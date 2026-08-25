@@ -8,6 +8,7 @@ import pytest
 
 from onitrack.apple import (
     APNS_TOPICS,
+    AppleRegistrationError,
     _anisette_headers,
     _apns_activation_profile_id,
     _register_apns,
@@ -163,6 +164,94 @@ def test_apple_register_imports_external_validation_json(
     assert captured["anisette_serial"] == "SYNTHETIC-SERIAL"
     secrets = read_secrets(tmp_path)
     assert secrets["people"]["ids"]["registered"] is True
+
+
+def test_apple_register_can_replace_real_mac_device_registration(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+
+    async def fake_register_apns(device, existing):
+        captured["apns_device"] = device
+        captured["old_apns"] = existing
+        return {"courier_token": "new-token"}
+
+    def fake_register_ids(**kwargs):
+        captured.update(kwargs)
+        return IDSRegistrationResult(
+            ids_state={**kwargs["existing"], "registered": True},
+            account_state=kwargs["account_state"],
+        )
+
+    monkeypatch.setattr("onitrack.apple._register_apns", fake_register_apns)
+    monkeypatch.setattr("onitrack.apple.register_ids", fake_register_ids)
+    monkeypatch.setattr("onitrack.apple._anisette_headers", lambda *a, **kw: {})
+    write_secret_section(
+        tmp_path,
+        "account",
+        {"account": {"username": "person@example.com"}, "login": {"state": 3}},
+    )
+    write_secret_section(
+        tmp_path,
+        "people",
+        {
+            "apns": {"courier_token": "old-token"},
+            "ids": {
+                "registered": True,
+                "identity": {"old": "identity"},
+                "users": {"old": "registration"},
+            },
+        },
+    )
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(
+        json.dumps(
+            {
+                "validation_data": "dmFsaWRhdGlvbg==",
+                "valid_until": "2099-08-24T12:00:00Z",
+                "device_info": {
+                    "hardware_version": "Mac14,3",
+                    "serial_number": "SYNTHETIC-SERIAL",
+                    "software_name": "macOS",
+                    "software_version": "14.3",
+                    "software_build_id": "23D56",
+                    "unique_device_id": "REAL-MAC-UUID",
+                },
+            },
+        ),
+        encoding="utf-8",
+    )
+
+    result = register_state(
+        tmp_path,
+        validation_json=os.fspath(validation_path),
+        replace_device_registration=True,
+    )
+
+    assert result["status"] == "registered"
+    assert captured["apns_device"].udid != "REAL-MAC-UUID"
+    assert captured["old_apns"]["courier_token"] == "old-token"
+    assert captured["existing"]["uses_local_udid"] is True
+    assert "identity" not in captured["existing"]
+    assert "users" not in captured["existing"]
+    assert read_secrets(tmp_path)["people"]["apns"] == {
+        "courier_token": "new-token",
+    }
+
+
+def test_device_registration_replacement_requires_fresh_validation(tmp_path):
+    write_secret_section(
+        tmp_path,
+        "account",
+        {"account": {"username": "person@example.com"}, "login": {"state": 3}},
+    )
+
+    with pytest.raises(
+        AppleRegistrationError,
+        match="requires fresh --validation-json",
+    ):
+        register_state(tmp_path, replace_device_registration=True)
 
 
 def test_apple_register_ids_error_returns_clear_error(

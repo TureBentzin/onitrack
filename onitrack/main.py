@@ -81,6 +81,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="mac-registration-provider -once JSON path, or '-' for stdin",
     )
+    apple_register_parser.add_argument(
+        "--replace-device-registration",
+        action="store_true",
+        help="replace APNs/IDS registration with Onitrack's distinct device UUID",
+    )
     apple_parser.set_defaults(_command_parser=apple_parser)
     apple_register_parser.set_defaults(_command_parser=apple_register_parser)
 
@@ -239,6 +244,7 @@ def main(argv: list[str] | None = None) -> int:
                         resolve_config_dir(args.config_dir),
                         debug_redacted=args.debug_redacted,
                         validation_json=args.validation_json,
+                        replace_device_registration=args.replace_device_registration,
                     )
                 case None:
                     args._command_parser.error("apple requires a subcommand")

@@ -886,7 +886,14 @@ def _registration_device(device: Any, state: dict[str, Any]) -> Any:
                 _string_value(device_info.get("software_name")) or "macOS"
             ),
             source="mac-registration-provider",
-            udid=_string_value(device_info.get("unique_device_id")) or device.udid,
+            udid=(
+                device.udid
+                if state.get("uses_local_udid") is True
+                else (
+                    _string_value(device_info.get("unique_device_id"))
+                    or device.udid
+                )
+            ),
         )
     return _nac_device(device)
 

@@ -341,6 +341,20 @@ def test_acquirer_timeout_is_readiness_result_without_ack(monkeypatch):
     assert "persisted" not in events
 
 
+def test_apns_connection_is_marked_active_before_topic_filters():
+    commands = []
+
+    class Connection:
+        async def _send(self, command):
+            commands.append(command)
+
+    asyncio.run(acquisition._set_apns_active(Connection()))
+
+    assert len(commands) == 1
+    assert commands[0].state == 1
+    assert commands[0].unknown2 == 0x7FFFFFFF
+
+
 class _FakeStream:
     def __init__(self, command):
         self.command = command
@@ -377,6 +391,9 @@ class _FakeConnection:
     async def ack(self, _command):
         self.events.append("transport_ack")
 
+    async def _send(self, _command):
+        return None
+
 
 class _Fixture(SimpleNamespace):
     pass
@@ -393,11 +410,11 @@ def _pair_ec_fixture(
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-    receiver_device = _even_p256_key()
-    receiver_prekey = _even_p256_key()
-    sender_device = _even_p256_key()
-    sender_prekey = _even_p256_key()
-    ephemeral = _even_p256_key()
+    receiver_device = _compact_p256_key()
+    receiver_prekey = _compact_p256_key()
+    sender_device = _compact_p256_key()
+    sender_prekey = _compact_p256_key()
+    ephemeral = _compact_p256_key()
     sender = "mailto:sender@example.invalid"
     sender_token = b"synthetic-sender-token"
     fm_id = "synthetic-fm-id"
@@ -520,12 +537,13 @@ def _pair_ec_fixture(
     )
 
 
-def _even_p256_key():
+def _compact_p256_key():
     from cryptography.hazmat.primitives.asymmetric import ec
 
+    prime = (2**256) - (2**224) + (2**192) + (2**96) - 1
     while True:
         key = ec.generate_private_key(ec.SECP256R1())
-        if key.public_key().public_numbers().y % 2 == 0:
+        if key.public_key().public_numbers().y * 2 <= prime:
             return key
 
 

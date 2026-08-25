@@ -34,12 +34,14 @@ def register(
     *,
     debug_redacted: bool = False,
     validation_json: str | None = None,
+    replace_device_registration: bool = False,
 ) -> int:
     try:
         result = register_state(
             config_dir,
             debug_redacted=debug_redacted,
             validation_json=validation_json,
+            replace_device_registration=replace_device_registration,
         )
     except SecretStoreError as exc:
         print(f"apple: secret_store_error: {exc}")
@@ -61,6 +63,7 @@ def register_state(
     *,
     debug_redacted: bool = False,
     validation_json: str | None = None,
+    replace_device_registration: bool = False,
 ) -> dict[str, Any]:
     migrate_legacy_secrets(config_dir)
     account = secret_section(config_dir, "account")
@@ -69,20 +72,36 @@ def register_state(
 
     device = load_or_create_device_identity(config_dir)
     people = secret_section(config_dir, "people")
+    if replace_device_registration and validation_json is None:
+        raise AppleRegistrationError(
+            "device registration replacement requires fresh --validation-json",
+        )
     if validation_json is not None:
         people = _merge_dicts(
             people,
             {"ids": {"external_validation": load_validation_json(validation_json)}},
         )
-        write_secret_section(config_dir, "people", people)
-    if _registered(people):
+        if not replace_device_registration:
+            write_secret_section(config_dir, "people", people)
+    if _registered(people) and not replace_device_registration:
         return {
             "status": "registered",
             "device_display_name": device.display_name,
             "device_profile": device.product_type,
         }
 
-    ids_state = _dict_value(people.get("ids"))
+    if replace_device_registration:
+        ids_state = {
+            "external_validation": _dict_path(
+                people,
+                "ids",
+                "external_validation",
+            ),
+            "uses_local_udid": True,
+        }
+        people = {**people, "ids": ids_state}
+    else:
+        ids_state = _dict_value(people.get("ids"))
     registration_device = _registration_device(device, ids_state)
     people = _merge_dicts(
         people,
@@ -95,7 +114,8 @@ def register_state(
             ),
         },
     )
-    write_secret_section(config_dir, "people", people)
+    if not replace_device_registration:
+        write_secret_section(config_dir, "people", people)
 
     try:
         external_device_info = _dict_path(
