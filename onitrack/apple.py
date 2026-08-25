@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 from pathlib import Path
 from typing import Any
 
 from onitrack.auth import _anisette_libs_path, _close_account
-from onitrack.ids import IDSRegistrationError, register_ids
+from onitrack.ids import IDSRegistrationError, _registration_device, register_ids
 from onitrack.people import load_or_create_device_identity
 from onitrack.state import (
     SecretStoreError,
@@ -81,11 +82,16 @@ def register_state(
             "device_profile": device.product_type,
         }
 
+    ids_state = _dict_value(people.get("ids"))
+    registration_device = _registration_device(device, ids_state)
     people = _merge_dicts(
         people,
         {
             "apns": asyncio.run(
-                _register_apns(device, _dict_value(people.get("apns"))),
+                _register_apns(
+                    registration_device,
+                    _dict_value(people.get("apns")),
+                ),
             ),
         },
     )
@@ -126,6 +132,9 @@ def register_state(
 
 
 async def _register_apns(device: Any, existing: dict[str, Any]) -> dict[str, Any]:
+    activation_profile_id = _apns_activation_profile_id(device)
+    if existing.get("activation_profile_id") != activation_profile_id:
+        existing = {}
     scoped = _dict_value(existing.get("scoped_tokens"))
     if (
         existing.get("courier_token")
@@ -159,9 +168,15 @@ async def _register_apns(device: Any, existing: dict[str, Any]) -> dict[str, Any
         certificate, private_key = await apns.activate(
             device_class="MacOS",
             udid=device.udid,
-            serial=device.udid[:12],
+            serial=(
+                _string_value(getattr(device, "serial_number", None))
+                or device.udid[:12]
+            ),
             version=device.os_version,
-            build=_macos_build_for_version(device.os_version),
+            build=(
+                _string_value(getattr(device, "os_build", None))
+                or _macos_build_for_version(device.os_version)
+            ),
             model=device.product_type,
         )
         certificate_pem = certificate.public_bytes(
@@ -187,11 +202,24 @@ async def _register_apns(device: Any, existing: dict[str, Any]) -> dict[str, Any
 
     return {
         **existing,
+        "activation_profile_id": activation_profile_id,
         "certificate_pem": certificate_pem,
         "courier_token": base_token.hex(),
         "private_key_pem": private_key_pem,
         "scoped_tokens": scoped_tokens,
     }
+
+
+def _apns_activation_profile_id(device: Any) -> str:
+    fields = (
+        _string_value(getattr(device, "source", None)) or "onitrack-emulated",
+        device.product_type,
+        device.os_version,
+        _string_value(getattr(device, "os_build", None)) or "",
+        _string_value(getattr(device, "serial_number", None)) or "",
+        device.udid,
+    )
+    return hashlib.sha256("\0".join(fields).encode("utf-8")).hexdigest()
 
 
 def _anisette_headers(

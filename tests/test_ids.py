@@ -10,6 +10,7 @@ from onitrack.ids import (
     IDSRegistrationError,
     _authenticate_ds_id,
     _generate_auth_csr,
+    _id_register,
     _login_ids_delegate,
     _mme_client_info,
     _nac_device,
@@ -206,3 +207,78 @@ def test_external_validation_selects_real_mac_device_tuple():
     assert _mme_client_info(device).startswith("<Mac14,3> <macOS;14.3;23D56>")
     assert _version_ua(device) == "[macOS,14.3,23D56,Mac14,3]"
     assert _registration_validation_data(state) == b"validation"
+
+
+def test_id_register_uses_xml_and_external_build_tuple(monkeypatch):
+    captured = {}
+
+    class FakeSigningKey:
+        def sign(self, *args, **kwargs):
+            return b"signature"
+
+    class FakeIdentity:
+        def legacy_public_identity(self):
+            return b"legacy"
+
+        def prekey_data(self):
+            return b"prekey"
+
+        def kt_loggable_data(self):
+            return b"kt-data"
+
+    def fake_request_plist(url, *, headers, body, auth=None):
+        captured["body"] = body
+        return {
+            "status": 0,
+            "services": [
+                {
+                    "service": "com.apple.private.alloy.multiplex1",
+                    "users": [
+                        {
+                            "user-id": "synthetic-user",
+                            "status": 0,
+                            "cert": b"registration-cert",
+                            "uris": [
+                                {"status": 0, "uri": "mailto:test@example.invalid"},
+                            ],
+                        },
+                    ],
+                },
+            ],
+        }
+
+    monkeypatch.setattr("onitrack.ids._bag", lambda key: "https://example.invalid")
+    monkeypatch.setattr("onitrack.ids._request_plist", fake_request_plist)
+
+    _id_register(
+        user_id="synthetic-user",
+        auth=type(
+            "Auth",
+            (),
+            {"cert_der": b"auth-cert", "private_key": FakeSigningKey()},
+        )(),
+        handles=["mailto:test@example.invalid"],
+        identity=FakeIdentity(),
+        push_token=b"push-token",
+        push_cert=b"push-cert",
+        push_key=FakeSigningKey(),
+        device=type(
+            "Device",
+            (),
+            {
+                "display_name": "synthetic-device",
+                "os_build": "99Z999",
+                "os_version": "99.1",
+                "product_type": "MacTest1,1",
+                "software_name": "macOS",
+                "udid": "SYNTHETIC-UUID",
+            },
+        )(),
+        validation_data=b"validation",
+    )
+
+    payload = gzip.decompress(captured["body"])
+    assert payload.startswith(b"<?xml")
+    body = plistlib.loads(payload)
+    assert body["os-version"] == "macOS,99.1,99Z999"
+    assert body["software-version"] == "99Z999"

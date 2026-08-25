@@ -6,7 +6,13 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from onitrack.apple import _anisette_headers, _register_apns, register_state
+from onitrack.apple import (
+    APNS_TOPICS,
+    _anisette_headers,
+    _apns_activation_profile_id,
+    _register_apns,
+    register_state,
+)
 from onitrack.ids import IDSRegistrationError, IDSRegistrationResult
 from onitrack.main import main
 from onitrack.state import read_secrets, write_secret_section
@@ -32,10 +38,15 @@ def test_apple_register_persists_native_ids_state(
             },
         )
 
+    async def fake_register_apns(device, existing):
+        captured["apns_device"] = device
+        return existing
+
     monkeypatch.setattr(
         "onitrack.apple._anisette_headers",
         lambda *args, **kwargs: {"h": "v"},
     )
+    monkeypatch.setattr("onitrack.apple._register_apns", fake_register_apns)
     monkeypatch.setattr("onitrack.apple.register_ids", fake_register_ids)
     write_secret_section(
         tmp_path,
@@ -88,11 +99,16 @@ def test_apple_register_imports_external_validation_json(
             account_state={"account": {"username": "person@example.com"}},
         )
 
+    async def fake_register_apns(device, existing):
+        captured["apns_device"] = device
+        return existing
+
     def fake_anisette_headers(*args, **kwargs):
         captured["anisette_serial"] = kwargs["serial_number"]
         return {}
 
     monkeypatch.setattr("onitrack.apple._anisette_headers", fake_anisette_headers)
+    monkeypatch.setattr("onitrack.apple._register_apns", fake_register_apns)
     monkeypatch.setattr("onitrack.apple.register_ids", fake_register_ids)
     write_secret_section(
         tmp_path,
@@ -154,10 +170,14 @@ def test_apple_register_ids_error_returns_clear_error(
     tmp_path,
     capsys,
 ):
+    async def fake_register_apns(device, existing):
+        return existing
+
     monkeypatch.setattr(
         "onitrack.apple._anisette_headers",
         lambda *args, **kwargs: {},
     )
+    monkeypatch.setattr("onitrack.apple._register_apns", fake_register_apns)
     monkeypatch.setattr(
         "onitrack.apple.register_ids",
         lambda **kwargs: (_ for _ in ()).throw(
@@ -230,6 +250,8 @@ def test_register_apns_activates_and_mints_scoped_tokens(monkeypatch):
     async def fake_activate(**kwargs):
         assert kwargs["device_class"] == "MacOS"
         assert kwargs["model"] == "Macmini9,1"
+        assert kwargs["build"] == "99Z999"
+        assert kwargs["serial"] == "SYNTHETIC-SERIAL"
         return certificate, private_key
 
     fake_apns = types.SimpleNamespace(
@@ -243,7 +265,10 @@ def test_register_apns_activates_and_mints_scoped_tokens(monkeypatch):
     state = asyncio_run_register_apns(
         types.SimpleNamespace(
             os_version="14.6",
+            os_build="99Z999",
             product_type="Macmini9,1",
+            serial_number="SYNTHETIC-SERIAL",
+            source="synthetic-test",
             udid="ABCDEF123456",
         ),
     )
@@ -251,6 +276,7 @@ def test_register_apns_activates_and_mints_scoped_tokens(monkeypatch):
     assert state["courier_token"] == "aa"
     assert state["certificate_pem"].startswith("-----BEGIN CERTIFICATE-----")
     assert state["private_key_pem"].startswith("-----BEGIN PRIVATE KEY-----")
+    assert len(state["activation_profile_id"]) == 64
     assert set(state["scoped_tokens"]) == {
         "com.apple.private.ids",
         "com.apple.private.alloy.fmf",
@@ -259,10 +285,30 @@ def test_register_apns_activates_and_mints_scoped_tokens(monkeypatch):
     }
 
 
-def asyncio_run_register_apns(device):
+def test_register_apns_reuses_only_matching_activation_profile():
+    device = types.SimpleNamespace(
+        os_version="99.1",
+        os_build="99Z999",
+        product_type="MacTest1,1",
+        serial_number="SYNTHETIC-SERIAL",
+        source="synthetic-test",
+        udid="SYNTHETIC-UUID",
+    )
+    existing = {
+        "activation_profile_id": _apns_activation_profile_id(device),
+        "certificate_pem": "certificate",
+        "courier_token": "00",
+        "private_key_pem": "private-key",
+        "scoped_tokens": {topic: "01" for topic in APNS_TOPICS},
+    }
+
+    assert asyncio_run_register_apns(device, existing) == existing
+
+
+def asyncio_run_register_apns(device, existing=None):
     import asyncio
 
-    return asyncio.run(_register_apns(device, {}))
+    return asyncio.run(_register_apns(device, existing or {}))
 
 
 def test_anisette_headers_uses_external_serial(monkeypatch, tmp_path):

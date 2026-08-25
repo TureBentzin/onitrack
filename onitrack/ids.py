@@ -398,7 +398,7 @@ def _id_register(
     body = gzip.compress(
         plistlib.dumps(
             _register_body(user_id, handles, identity, device, validation_data),
-            fmt=plistlib.FMT_BINARY,
+            fmt=plistlib.FMT_XML,
         ),
     )
     headers = {
@@ -424,7 +424,9 @@ def _id_register(
     response = _request_plist(_bag("id-register"), headers=headers, body=body)
     status = int(response.get("status", 1))
     if status != 0:
-        raise IDSRegistrationError(f"IDS register failed: {status}")
+        raise IDSRegistrationError(
+            f"IDS register failed: {status} {_redacted_plist_summary(response)}",
+        )
     return _parse_registration_response(response, user_id)
 
 
@@ -435,6 +437,8 @@ def _register_body(
     device: Any,
     validation_data: bytes,
 ) -> dict[str, Any]:
+    software_name = _string_value(getattr(device, "software_name", None)) or "macOS"
+    software_build = _device_build(device)
     client_data = {
         "public-message-identity-key": identity.legacy_public_identity(),
         "public-message-identity-version": 2,
@@ -448,7 +452,7 @@ def _register_body(
         "device-name": device.display_name,
         "hardware-version": device.product_type,
         "language": "en-US",
-        "os-version": f"macOS,{device.os_version},{_macos_build(device.os_version)}",
+        "os-version": f"{software_name},{device.os_version},{software_build}",
         "private-device-data": _private_device_data(device),
         "services": [
             {
@@ -471,7 +475,7 @@ def _register_body(
                 ],
             },
         ],
-        "software-version": _macos_build(device.os_version),
+        "software-version": software_build,
         "validation-data": validation_data,
     }
 
@@ -587,6 +591,12 @@ def _redacted_plist_summary(data: Any) -> str:
         value = _categorical_error(data.get(key))
         if value is not None:
             fields.append(f"{key}={value!r}")
+    if any(
+        "VEN-PROD" in value
+        for key in ("description", "message", "error-message", "status-message")
+        if isinstance((value := data.get(key)), str)
+    ):
+        fields.append("error-category='VEN-PROD'")
     if not fields:
         fields.append("no allowlisted error fields")
     return " ".join(fields)
@@ -882,6 +892,7 @@ def _registration_device(device: Any, state: dict[str, Any]) -> Any:
 
 
 def _private_device_data(device: Any) -> dict[str, Any]:
+    software_name = _string_value(getattr(device, "software_name", None)) or "macOS"
     return {
         "ap": "0",
         "d": f"{time.time() - 978307200:.6f}",
@@ -891,7 +902,7 @@ def _private_device_data(device: Any) -> dict[str, Any]:
         "m": "0",
         "p": "0",
         "pb": _device_build(device),
-        "pn": "macOS",
+        "pn": "macOS" if software_name == "MacOS" else software_name,
         "pv": device.os_version,
         "s": "0",
         "t": "0",
@@ -910,8 +921,9 @@ def _mme_client_info(device: Any) -> str:
 
 
 def _version_ua(device: Any) -> str:
+    software_name = _string_value(getattr(device, "software_name", None)) or "macOS"
     return (
-        f"[macOS,{device.os_version},{_device_build(device)},"
+        f"[{software_name},{device.os_version},{_device_build(device)},"
         f"{device.product_type}]"
     )
 
