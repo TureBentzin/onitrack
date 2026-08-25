@@ -122,6 +122,10 @@ let
       hash = "sha256-/cnqYSLr3HWoxOniP2N4gSEWMqC7v6C4r5ncbR2jNr4=";
     };
 
+    patches = [
+      ./patches/findmy-profiled-mobileme.patch
+    ];
+
     build-system = with pythonPackages; [
       setuptools
       setuptools-scm

@@ -11,6 +11,7 @@ from onitrack.ids import (
     _authenticate_ds_id,
     _generate_auth_csr,
     _login_ids_delegate,
+    _mme_client_info,
     _nac_device,
     _registration_device,
     _registration_validation_data,
@@ -52,15 +53,17 @@ def test_request_plist_reports_redacted_http_error(monkeypatch):
     message = str(exc_info.value)
     assert "HTTP 400" in message
     assert "localizedError='INVALID_REQUEST'" in message
-    assert "description='bad delegate'" in message
+    assert "bad delegate" not in message
 
 
 def test_login_ids_delegate_recommends_refresh_for_unauthorized(monkeypatch):
     def fake_request_plist(*args, **kwargs):
         raise IDSRegistrationError(
             "Apple request failed: HTTP 401 "
-            "localizedError='UNAUTHORIZED' "
-            "description='These account credentials are unauthorized.'",
+            "localizedError='UNAUTHORIZED'",
+            http_status=401,
+            apple_status=-20101,
+            localized_error="UNAUTHORIZED",
         )
 
     monkeypatch.setattr("onitrack.ids._request_plist", fake_request_plist)
@@ -79,7 +82,11 @@ def test_login_ids_delegate_recommends_refresh_for_unauthorized(monkeypatch):
             validation_data=b"validation",
         )
 
-    assert "auth provision --refresh" in str(exc_info.value)
+    message = str(exc_info.value)
+    assert "HTTP 401" in message
+    assert "status=-20101" in message
+    assert "localizedError=UNAUTHORIZED" in message
+    assert "account credentials" not in message
 
 
 def test_generate_auth_csr_matches_ids_sha1_shape():
@@ -169,6 +176,8 @@ def test_external_validation_selects_real_mac_device_tuple():
             "validation_data": "dmFsaWRhdGlvbg==",
             "device_info": {
                 "hardware_version": "Mac14,3",
+                "serial_number": "SYNTHETIC-SERIAL",
+                "software_name": "macOS",
                 "software_version": "14.3",
                 "software_build_id": "23D56",
                 "unique_device_id": "REAL-UUID",
@@ -192,5 +201,8 @@ def test_external_validation_selects_real_mac_device_tuple():
 
     assert device.display_name == "onitrack@host"
     assert device.udid == "REAL-UUID"
+    assert device.serial_number == "SYNTHETIC-SERIAL"
+    assert device.software_name == "macOS"
+    assert _mme_client_info(device).startswith("<Mac14,3> <macOS;14.3;23D56>")
     assert _version_ua(device) == "[macOS,14.3,23D56,Mac14,3]"
     assert _registration_validation_data(state) == b"validation"

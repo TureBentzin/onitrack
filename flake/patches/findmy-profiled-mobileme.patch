@@ -1,0 +1,17 @@
+diff --git a/findmy/reports/account.py b/findmy/reports/account.py
+--- a/findmy/reports/account.py
++++ b/findmy/reports/account.py
+@@ -902,8 +902,11 @@ class AsyncAppleAccount(BaseAppleAccount):
+         headers = {
+             "X-Apple-ADSID": self._login_state_data["adsid"],
+             "User-Agent": "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0",
+-            "X-Mme-Client-Info": "<MacBookPro18,3> <Mac OS X;13.4.1;22F8>"
+-            " <com.apple.AOSKit/282 (com.apple.accountsd/113)>",
++            "X-Mme-Client-Info": getattr(
++                self._anisette,
++                "mobileme_client",
++                self._anisette.client,
++            ),
+         }
+         headers.update(await self.get_anisette_headers())
+ 

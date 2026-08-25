@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import inspect
-import json
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +14,7 @@ from onitrack.state import (
     secret_section,
     write_secret_section,
 )
+from onitrack.validation import ValidationDataError, load_validation_json
 
 APNS_TOPICS = (
     "com.apple.private.ids",
@@ -45,6 +43,9 @@ def register(
     except SecretStoreError as exc:
         print(f"apple: secret_store_error: {exc}")
         return 1
+    except ValidationDataError as exc:
+        print(f"apple: validation_error: {exc}")
+        return 1
     except AppleRegistrationError as exc:
         print(f"apple: registration_error: {exc}")
         return 1
@@ -70,7 +71,7 @@ def register_state(
     if validation_json is not None:
         people = _merge_dicts(
             people,
-            {"ids": {"external_validation": _load_validation_json(validation_json)}},
+            {"ids": {"external_validation": load_validation_json(validation_json)}},
         )
         write_secret_section(config_dir, "people", people)
     if _registered(people):
@@ -91,9 +92,21 @@ def register_state(
     write_secret_section(config_dir, "people", people)
 
     try:
+        external_device_info = _dict_path(
+            people,
+            "ids",
+            "external_validation",
+            "device_info",
+        )
         ids_result = register_ids(
             account_state=account,
-            anisette_headers=_anisette_headers(config_dir, account),
+            anisette_headers=_anisette_headers(
+                config_dir,
+                account,
+                serial_number=_string_value(
+                    external_device_info.get("serial_number"),
+                ),
+            ),
             apns_state=_dict_value(people.get("apns")),
             device=device,
             existing=_dict_value(people.get("ids")),
@@ -184,6 +197,8 @@ async def _register_apns(device: Any, existing: dict[str, Any]) -> dict[str, Any
 def _anisette_headers(
     config_dir: Path,
     account_state: dict[str, Any],
+    *,
+    serial_number: str | None = None,
 ) -> dict[str, str]:
     from findmy import AppleAccount
 
@@ -192,7 +207,12 @@ def _anisette_headers(
         anisette_libs_path=_anisette_libs_path(config_dir),
     )
     try:
-        return dict(account.get_anisette_headers(with_client_info=False))
+        return dict(
+            account.get_anisette_headers(
+                with_client_info=False,
+                serial=serial_number or "0",
+            ),
+        )
     finally:
         _close_account(account)
 
@@ -227,53 +247,6 @@ def _bytes_from_hex(value: str | None) -> bytes | None:
         return bytes.fromhex(value)
     except ValueError as exc:
         raise AppleRegistrationError("stored APNs token is malformed") from exc
-
-
-def _load_validation_json(path: str) -> dict[str, Any]:
-    try:
-        raw = (
-            sys.stdin.read()
-            if path == "-"
-            else Path(path).read_text(encoding="utf-8")
-        )
-        data = json.loads(raw)
-    except OSError as exc:
-        raise AppleRegistrationError(f"failed to read validation JSON: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise AppleRegistrationError("validation JSON is malformed") from exc
-    if not isinstance(data, dict):
-        raise AppleRegistrationError("validation JSON must be an object")
-
-    validation_data = _string_value(data.get("validation_data"))
-    if validation_data is None:
-        raise AppleRegistrationError("validation JSON is missing validation_data")
-    try:
-        base64.b64decode(validation_data, validate=True)
-    except ValueError as exc:
-        raise AppleRegistrationError("validation_data must be base64") from exc
-
-    device_info = _dict_value(data.get("device_info"))
-    required_device_fields = (
-        "hardware_version",
-        "software_version",
-        "software_build_id",
-    )
-    missing = [
-        field
-        for field in required_device_fields
-        if _string_value(device_info.get(field)) is None
-    ]
-    if missing:
-        raise AppleRegistrationError(
-            "validation JSON is missing device_info fields: " + ", ".join(missing),
-        )
-
-    return {
-        "device_info": device_info,
-        "source": "mac-registration-provider",
-        "valid_until": _string_value(data.get("valid_until")),
-        "validation_data": validation_data,
-    }
 
 
 async def _maybe_await(value: Any) -> Any:

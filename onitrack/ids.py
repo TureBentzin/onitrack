@@ -39,7 +39,18 @@ NAC_OS_VERSION = "13.6.4"
 
 
 class IDSRegistrationError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        http_status: int | None = None,
+        apple_status: int | None = None,
+        localized_error: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+        self.apple_status = apple_status
+        self.localized_error = localized_error
 
 
 @dataclass(frozen=True)
@@ -263,11 +274,23 @@ def _login_ids_delegate(
             auth=(username, idms_pet),
         )
     except IDSRegistrationError as exc:
-        if "localizedError='UNAUTHORIZED'" in str(exc):
+        if exc.localized_error == "UNAUTHORIZED" or (
+            exc.localized_error is None
+            and "localizedError='UNAUTHORIZED'" in str(exc)
+        ):
+            details = []
+            if exc.http_status is not None:
+                details.append(f"HTTP {exc.http_status}")
+            if exc.apple_status is not None:
+                details.append(f"status={exc.apple_status}")
+            details.append("localizedError=UNAUTHORIZED")
             raise IDSRegistrationError(
-                "IDS delegate login was unauthorized; run "
-                "`onitrack auth provision --refresh` and then retry "
-                "`onitrack apple register --debug-redacted`",
+                "IDS delegate login was unauthorized "
+                f"({' '.join(details)}); retry with fresh validation and "
+                "refreshed authentication",
+                http_status=exc.http_status,
+                apple_status=exc.apple_status,
+                localized_error="UNAUTHORIZED",
             ) from exc
         raise
     if int(response.get("status", 1)) != 0:
@@ -526,6 +549,9 @@ def _request_plist(
         raise IDSRegistrationError(
             f"Apple request failed: HTTP {exc.code} "
             f"{_redacted_plist_summary(decoded_error)}",
+            http_status=exc.code,
+            apple_status=_numeric_status(decoded_error.get("status")),
+            localized_error=_localized_error(decoded_error),
         ) from exc
     except error.URLError as exc:
         raise IDSRegistrationError(f"Apple request failed: {exc.reason}") from exc
@@ -554,21 +580,33 @@ def _redacted_plist_summary(data: Any) -> str:
     if not isinstance(data, dict):
         return "non-dictionary plist"
     fields = []
-    for key in (
-        "status",
-        "error",
-        "localizedError",
-        "localized-error",
-        "description",
-        "message",
-        "error-message",
-    ):
-        value = data.get(key)
-        if isinstance(value, (str, int, float, bool)):
+    status = _numeric_status(data.get("status"))
+    if status is not None:
+        fields.append(f"status={status}")
+    for key in ("error", "localizedError", "localized-error"):
+        value = _categorical_error(data.get(key))
+        if value is not None:
             fields.append(f"{key}={value!r}")
     if not fields:
-        fields.append("plist_keys=" + ",".join(sorted(str(key) for key in data)[:8]))
+        fields.append("no allowlisted error fields")
     return " ".join(fields)
+
+
+def _numeric_status(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _categorical_error(value: Any) -> str | None:
+    if not isinstance(value, str) or not 1 <= len(value) <= 80:
+        return None
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
+    return value if all(character in allowed for character in value) else None
+
+
+def _localized_error(data: dict[str, Any]) -> str | None:
+    return _categorical_error(
+        data.get("localizedError", data.get("localized-error")),
+    )
 
 
 def _bag(key: str) -> str:
@@ -814,6 +852,8 @@ def _nac_device(device: Any) -> Any:
         os_build=_macos_build(NAC_OS_VERSION),
         os_version=NAC_OS_VERSION,
         product_type=NAC_PRODUCT_TYPE,
+        serial_number=None,
+        software_name="macOS",
         source="pypush-emulated-nac",
         udid=device.udid,
     )
@@ -831,6 +871,10 @@ def _registration_device(device: Any, state: dict[str, Any]) -> Any:
             os_build=os_build,
             os_version=os_version,
             product_type=product_type,
+            serial_number=_string_value(device_info.get("serial_number")),
+            software_name=(
+                _string_value(device_info.get("software_name")) or "macOS"
+            ),
             source="mac-registration-provider",
             udid=_string_value(device_info.get("unique_device_id")) or device.udid,
         )
@@ -857,8 +901,9 @@ def _private_device_data(device: Any) -> dict[str, Any]:
 
 
 def _mme_client_info(device: Any) -> str:
+    software_name = _string_value(getattr(device, "software_name", None)) or "macOS"
     return (
-        f"<{device.product_type}> <macOS;{device.os_version};"
+        f"<{device.product_type}> <{software_name};{device.os_version};"
         f"{_device_build(device)}> "
         "<com.apple.AOSKit/282 (com.apple.accountsd/113)>"
     )

@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from onitrack.apple import _register_apns, register_state
+from onitrack.apple import _anisette_headers, _register_apns, register_state
 from onitrack.ids import IDSRegistrationError, IDSRegistrationResult
 from onitrack.main import main
 from onitrack.state import read_secrets, write_secret_section
@@ -32,7 +32,10 @@ def test_apple_register_persists_native_ids_state(
             },
         )
 
-    monkeypatch.setattr("onitrack.apple._anisette_headers", lambda *args: {"h": "v"})
+    monkeypatch.setattr(
+        "onitrack.apple._anisette_headers",
+        lambda *args, **kwargs: {"h": "v"},
+    )
     monkeypatch.setattr("onitrack.apple.register_ids", fake_register_ids)
     write_secret_section(
         tmp_path,
@@ -85,7 +88,11 @@ def test_apple_register_imports_external_validation_json(
             account_state={"account": {"username": "person@example.com"}},
         )
 
-    monkeypatch.setattr("onitrack.apple._anisette_headers", lambda *args: {})
+    def fake_anisette_headers(*args, **kwargs):
+        captured["anisette_serial"] = kwargs["serial_number"]
+        return {}
+
+    monkeypatch.setattr("onitrack.apple._anisette_headers", fake_anisette_headers)
     monkeypatch.setattr("onitrack.apple.register_ids", fake_register_ids)
     write_secret_section(
         tmp_path,
@@ -117,6 +124,8 @@ def test_apple_register_imports_external_validation_json(
                 "valid_until": "2026-08-24T12:00:00Z",
                 "device_info": {
                     "hardware_version": "Mac14,3",
+                    "serial_number": "SYNTHETIC-SERIAL",
+                    "software_name": "macOS",
                     "software_version": "14.3",
                     "software_build_id": "23D56",
                 },
@@ -135,6 +144,7 @@ def test_apple_register_imports_external_validation_json(
     external = captured["existing"]["external_validation"]
     assert external["validation_data"] == "dmFsaWRhdGlvbg=="
     assert external["device_info"]["hardware_version"] == "Mac14,3"
+    assert captured["anisette_serial"] == "SYNTHETIC-SERIAL"
     secrets = read_secrets(tmp_path)
     assert secrets["people"]["ids"]["registered"] is True
 
@@ -144,7 +154,10 @@ def test_apple_register_ids_error_returns_clear_error(
     tmp_path,
     capsys,
 ):
-    monkeypatch.setattr("onitrack.apple._anisette_headers", lambda *args: {})
+    monkeypatch.setattr(
+        "onitrack.apple._anisette_headers",
+        lambda *args, **kwargs: {},
+    )
     monkeypatch.setattr(
         "onitrack.apple.register_ids",
         lambda **kwargs: (_ for _ in ()).throw(
@@ -250,3 +263,38 @@ def asyncio_run_register_apns(device):
     import asyncio
 
     return asyncio.run(_register_apns(device, {}))
+
+
+def test_anisette_headers_uses_external_serial(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeAccount:
+        @classmethod
+        def from_json(cls, state, *, anisette_libs_path):
+            captured["state"] = state
+            captured["libs"] = anisette_libs_path
+            return cls()
+
+        def get_anisette_headers(self, *, with_client_info, serial):
+            captured["with_client_info"] = with_client_info
+            captured["serial"] = serial
+            return {"X-Test": "value"}
+
+        def close(self):
+            pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "findmy",
+        types.SimpleNamespace(AppleAccount=FakeAccount),
+    )
+
+    headers = _anisette_headers(
+        tmp_path,
+        {"account": {"username": "person@example.com"}},
+        serial_number="SYNTHETIC-SERIAL",
+    )
+
+    assert headers == {"X-Test": "value"}
+    assert captured["with_client_info"] is False
+    assert captured["serial"] == "SYNTHETIC-SERIAL"

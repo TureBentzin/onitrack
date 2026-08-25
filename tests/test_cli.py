@@ -25,6 +25,7 @@ def test_auth_provision_accepts_refresh_help(capsys):
     assert exc.value.code == 0
     output = capsys.readouterr().out
     assert "--refresh" in output
+    assert "--validation-json" in output
 
 
 def test_people_list_requires_output_mode(capsys):

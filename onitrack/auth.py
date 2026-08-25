@@ -22,20 +22,43 @@ from onitrack.state import (
     write_json_atomic,
     write_secret_section,
 )
+from onitrack.validation import ValidationDataError, load_validation_json
 
 ANISETTE_LIBS_TEMPLATE_ENV = "ONITRACK_ANISETTE_LIBS_TEMPLATE"
 ANISETTE_LIBS_FILE = "anisette-libs.tar"
 
 
-def provision(config_dir: Path, *, refresh: bool = False) -> int:
+def provision(
+    config_dir: Path,
+    *,
+    refresh: bool = False,
+    validation_json: str | None = None,
+) -> int:
     config_dir = ensure_config_dir(config_dir)
     try:
         migrate_legacy_secrets(config_dir)
+        validation = (
+            load_validation_json(validation_json)
+            if validation_json is not None
+            else {}
+        )
     except SecretStoreError as exc:
         print(f"auth: secret_store_error: {exc}")
         return 1
+    except ValidationDataError as exc:
+        print(f"auth: validation_error: {exc}")
+        return 1
     account_path = account_config_path(config_dir)
-    account = _load_or_create_account(account_path, config_dir, refresh=refresh)
+    try:
+        account = _load_or_create_account(
+            account_path,
+            config_dir,
+            refresh=refresh,
+            device_info=_dict_value(validation.get("device_info")),
+        )
+    except ValidationDataError as exc:
+        print(f"auth: validation_error: {exc}")
+        return 1
 
     if not refresh and _login_state_name(account.login_state) == "LOGGED_IN":
         _save_account(account_path, account)
@@ -87,6 +110,7 @@ def _load_or_create_account(
     config_dir: Path,
     *,
     refresh: bool = False,
+    device_info: dict[str, Any] | None = None,
 ) -> Any:
     from findmy import AppleAccount, LocalAnisetteProvider
 
@@ -95,8 +119,62 @@ def _load_or_create_account(
     if state is not None:
         return AppleAccount.from_json(state, anisette_libs_path=libs_path)
 
-    anisette = LocalAnisetteProvider(libs_path=libs_path)
+    anisette = (
+        _profiled_anisette_provider(libs_path, device_info)
+        if device_info
+        else LocalAnisetteProvider(libs_path=libs_path)
+    )
     return AppleAccount(anisette)
+
+
+def _profiled_anisette_provider(
+    libs_path: Path | None,
+    device_info: dict[str, Any],
+) -> Any:
+    from findmy import LocalAnisetteProvider
+
+    serial_number = _string_value(device_info.get("serial_number"))
+    hardware_version = _string_value(device_info.get("hardware_version"))
+    software_name = _string_value(device_info.get("software_name")) or "macOS"
+    software_version = _string_value(device_info.get("software_version"))
+    software_build = _string_value(device_info.get("software_build_id"))
+    if not all((serial_number, hardware_version, software_version, software_build)):
+        raise ValidationDataError(
+            "validation device_info lacks serial/profile fields required for auth",
+        )
+
+    class ProfiledLocalAnisetteProvider(LocalAnisetteProvider):
+        @property
+        def client(self) -> str:
+            return (
+                f"<{hardware_version}> "
+                f"<{software_name};{software_version};{software_build}> "
+                "<com.apple.AOSKit/282 (com.apple.dt.Xcode/3594.4.19)>"
+            )
+
+        @property
+        def mobileme_client(self) -> str:
+            return (
+                f"<{hardware_version}> "
+                f"<{software_name};{software_version};{software_build}> "
+                "<com.apple.AOSKit/282 (com.apple.accountsd/113)>"
+            )
+
+        async def get_headers(
+            self,
+            user_id: str,
+            device_id: str,
+            serial: str = "0",
+            with_client_info: bool = False,
+        ) -> dict[str, str]:
+            return await super().get_headers(
+                user_id,
+                device_id,
+                serial_number if serial == "0" else serial,
+                with_client_info,
+            )
+
+    return ProfiledLocalAnisetteProvider(libs_path=libs_path)
 
 
 def _complete_2fa(account: Any) -> Any:
@@ -194,3 +272,7 @@ def _copy_private_file(source: Path, destination: Path) -> None:
 
 def _dict_value(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _string_value(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None

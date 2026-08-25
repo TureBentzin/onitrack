@@ -47,6 +47,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="force a fresh Apple login even when saved state is logged in",
     )
+    auth_provision_parser.add_argument(
+        "--validation-json",
+        default=None,
+        help="use mac-registration-provider device profile during fresh auth",
+    )
     auth_subparsers.add_parser("status", help="show offline auth state status")
     auth_subparsers.add_parser(
         "upgrade",
@@ -195,6 +200,7 @@ def main(argv: list[str] | None = None) -> int:
                     return provision(
                         resolve_config_dir(args.config_dir),
                         refresh=args.refresh,
+                        validation_json=args.validation_json,
                     )
                 case "status":
                     return print_status(resolve_config_dir(args.config_dir))
