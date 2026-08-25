@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -35,9 +36,10 @@ from onitrack.state import (
 )
 
 FMF_ENDPOINT_TEMPLATE = (
-    "https://{host}/fmipservice/friends/fmfd/{dsid}/{device_udid}/initClient"
+    "https://{host}/fmipservice/friends/fmfd/{dsid}/{device_udid}/{path}"
 )
 DEFAULT_FMF_HOST = "p01-fmfmobile.icloud.com"
+FMF_MODEL_VERSION = "1"
 APPLE_PRODUCT_TYPE = "Macmini9,1"
 APPLE_FALLBACK_PRODUCT_TYPE = "MacBookPro18,3"
 APPLE_OS_VERSION = "14.6"
@@ -286,6 +288,80 @@ def import_people_key(
     return 0
 
 
+def acquire_people_key(
+    config_dir: Path,
+    *,
+    alias: str,
+    wait_seconds: int,
+    debug_redacted: bool = False,
+) -> int:
+    if wait_seconds <= 0:
+        print("people: key_error: wait seconds must be greater than zero")
+        return 1
+
+    try:
+        migrate_legacy_secrets(config_dir)
+        people_state = load_people_state(config_dir)
+        person_id = _person_id_for_alias(people_state, alias)
+        logger = DebugLogger(config_dir, enabled=debug_redacted)
+        key = PeopleClient(config_dir, debug_logger=logger).acquire_key(
+            alias,
+            wait_seconds=wait_seconds,
+        )
+    except SecretStoreError as exc:
+        print(f"people: secret_store_error: {exc}")
+        return 1
+    except PeopleProvisioningError as exc:
+        print(f"people: provisioning_error: {exc}")
+        return 1
+    except PeopleProtocolError as exc:
+        status = "unknown" if exc.status is None else str(exc.status)
+        print(f"people: protocol_error: status={status} category={exc}")
+        return 1
+    except PeopleLocationError as exc:
+        print(f"people: key_error: {exc}")
+        return 1
+    except Exception as exc:
+        from onitrack.key_acquisition import (
+            KeyAcquisitionError,
+            KeyAcquisitionTimeout,
+        )
+
+        if isinstance(exc, KeyAcquisitionTimeout):
+            print(
+                json.dumps(
+                    {
+                        "alias_id": anonymize_value(config_dir, alias),
+                        "person_id": person_id,
+                        "key_status": "pending",
+                        "readiness": "sharing_device_may_be_offline",
+                    },
+                    sort_keys=True,
+                ),
+            )
+            return 0
+        if isinstance(exc, KeyAcquisitionError):
+            print(f"people: key_error: {exc}")
+            return 1
+        raise
+
+    print(
+        json.dumps(
+            {
+                "alias_id": anonymize_value(config_dir, alias),
+                "person_id": key.person_id,
+                "advertised_id_digest": anonymize_value(
+                    config_dir,
+                    key.advertised_id,
+                ),
+                "key_status": "ready",
+            },
+            sort_keys=True,
+        ),
+    )
+    return 0
+
+
 def _store_people_key(
     config_dir: Path,
     *,
@@ -332,6 +408,136 @@ def get_people_location(
 
     print(json.dumps({"locations": [payload]}, indent=2, sort_keys=True))
     return 0
+
+
+class _FMFSession:
+    def __init__(
+        self,
+        *,
+        account: Any,
+        state: dict[str, Any],
+        device: DeviceIdentity,
+        debug_logger: DebugLogger,
+        aps_token: str = "",
+    ) -> None:
+        login_data = _dict_path(state, "login", "data")
+        mobileme_data = _dict_path(login_data, "mobileme_data")
+        self.dsid = _string_value(login_data.get("dsid"))
+        if self.dsid is None:
+            raise PeopleProvisioningError("saved account is missing DSID")
+        self.token = _find_first_string(
+            mobileme_data,
+            (
+                "friendsToken",
+                "mmeFMFToken",
+                "fmfToken",
+                "mmeFMFAppToken",
+                "authToken",
+            ),
+        )
+        if self.token is None:
+            raise PeopleProvisioningError("saved account is missing an FMF token")
+        self.host = _normalize_host(
+            _find_first_string(
+                mobileme_data,
+                ("fmfHost", "friendsHost", "mmeFMFHost", "host", "url"),
+            )
+            or DEFAULT_FMF_HOST,
+        )
+        self.account = account
+        self.device = device
+        self.debug_logger = debug_logger
+        self.aps_token = aps_token
+        self.caller = (
+            _string_value(_dict_path(state, "account").get("username")) or ""
+        )
+        self.server_context: Any = {
+            "authToken": _base64_text(self.token),
+            "clientId": _base64_text(device.udid),
+            "prsId": self.dsid,
+        }
+        self.data_context: Any = {}
+
+    def initialize(self) -> dict[str, Any]:
+        return self._request("initClient")
+
+    def refresh(self, *, selected_fm_id: str | None = None) -> dict[str, Any]:
+        path = (
+            "minCallback/selFriend/refreshClient"
+            if selected_fm_id is not None
+            else "minCallback/refreshClient"
+        )
+        return self._request(path, selected_fm_id=selected_fm_id)
+
+    def _request(
+        self,
+        path: str,
+        *,
+        selected_fm_id: str | None = None,
+    ) -> dict[str, Any]:
+        headers = dict(self.account.get_anisette_headers(with_client_info=True))
+        headers.update(
+            {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "findmylocated/1 CFNetwork/1496.0.7 Darwin/23.5.0",
+                "X-FMF-Model-Version": FMF_MODEL_VERSION,
+            },
+        )
+        client_context = {
+            "appName": "findmylocated",
+            "apsToken": self.aps_token,
+            "callerHandleId": self.caller,
+            "contextBundleApp": FINDMYLOCATED_BUNDLE,
+            "currentTime": int(time.time() * 1000),
+            "deviceUDID": self.device.udid,
+            "deviceDisplayName": self.device.display_name,
+            "productType": self.device.product_type,
+            "osVersion": self.device.os_version,
+        }
+        if selected_fm_id is not None:
+            client_context["selectedFriend"] = selected_fm_id
+        body = {
+            "clientContext": client_context,
+            "dataContext": self.data_context,
+            "serverContext": self.server_context,
+        }
+        response = _post_json(
+            FMF_ENDPOINT_TEMPLATE.format(
+                host=self.host,
+                dsid=self.dsid,
+                device_udid=self.device.udid,
+                path=path,
+            ),
+            headers=headers,
+            auth=(self.dsid, self.token),
+            body=body,
+        )
+        if "serverContext" in response:
+            self.server_context = response["serverContext"]
+        if "dataContext" in response:
+            self.data_context = response["dataContext"]
+        self.debug_logger.emit(
+            "fmf_request",
+            {
+                "status": 200,
+                "path": path,
+                "dsid": self.dsid,
+                "fmf_host": self.host,
+                "fmId": selected_fm_id,
+                "model_version": FMF_MODEL_VERSION,
+                "response_keys": sorted(response),
+                "device_display_name": self.device.display_name,
+                "device_profile": self.device.product_type,
+                "device_profile_fallback": (
+                    self.device.product_type == APPLE_FALLBACK_PRODUCT_TYPE
+                ),
+                "following_count": len(response.get("following", []))
+                if isinstance(response.get("following"), list)
+                else 0,
+            },
+        )
+        return response
 
 
 class PeopleClient:
@@ -423,6 +629,83 @@ class PeopleClient:
         finally:
             _close_account(account)
 
+    def acquire_key(self, alias: str, *, wait_seconds: int) -> PeopleKey:
+        people_state = load_people_state(self.config_dir)
+        person_id = _person_id_for_alias(people_state, alias)
+        existing = load_people_key(people_state, person_id)
+        if existing is not None:
+            parse_people_private_key_blob(existing.private_key_blob)
+            return existing
+
+        account = self._load_logged_in_account()
+        try:
+            state = account.to_json()
+            device = load_or_create_device_identity(self.config_dir)
+            from onitrack.ids import _version_ua
+            from onitrack.key_acquisition import PeopleKeyAcquirer
+
+            acquirer = PeopleKeyAcquirer(
+                people_state=people_state,
+                user_agent=_version_ua(device),
+                debug_emit=self.debug_logger.emit,
+            )
+
+            def prepare_delivery(base_token: bytes) -> PersonRelationship:
+                session = _FMFSession(
+                    account=account,
+                    state=state,
+                    device=device,
+                    debug_logger=self.debug_logger,
+                    aps_token=base_token.hex(),
+                )
+                response = session.initialize()
+                relationship = relationship_for_person_id(
+                    self.config_dir,
+                    parse_following(response),
+                    person_id,
+                )
+                if relationship is None:
+                    raise PeopleLocationError(
+                        "configured alias no longer matches an accepted relationship",
+                    )
+                session.refresh()
+                session.refresh(selected_fm_id=relationship.fm_id)
+                self._fetch_searchparty(
+                    account,
+                    state,
+                    device,
+                    relationship.fm_id,
+                    None,
+                    base_token.hex(),
+                    intent="distributeKeys",
+                    mode="proactive",
+                )
+                return relationship
+
+            def accept_delivery(delivery: Any) -> None:
+                parse_people_private_key_blob(delivery.private_key_blob)
+                _store_people_key(
+                    self.config_dir,
+                    person_id=person_id,
+                    advertised_id=delivery.advertised_id,
+                    private_key_blob=delivery.private_key_blob,
+                )
+
+            delivery = asyncio.run(
+                acquirer.acquire(
+                    wait_seconds=wait_seconds,
+                    prepare_delivery=prepare_delivery,
+                    accept_delivery=accept_delivery,
+                ),
+            )
+            return PeopleKey(
+                person_id=person_id,
+                advertised_id=delivery.advertised_id,
+                private_key_blob=delivery.private_key_blob,
+            )
+        finally:
+            _close_account(account)
+
     def _load_logged_in_account(self) -> Any:
         account_path = account_config_path(self.config_dir)
         account_state = secret_section(self.config_dir, "account")
@@ -450,89 +733,12 @@ class PeopleClient:
         state: dict[str, Any],
         device: DeviceIdentity,
     ) -> dict[str, Any]:
-        login_data = _dict_path(state, "login", "data")
-        mobileme_data = _dict_path(login_data, "mobileme_data")
-        dsid = _string_value(login_data.get("dsid"))
-        if dsid is None:
-            raise PeopleProvisioningError("saved account is missing DSID")
-
-        token = _find_first_string(
-            mobileme_data,
-            (
-                "friendsToken",
-                "mmeFMFToken",
-                "fmfToken",
-                "mmeFMFAppToken",
-                "authToken",
-            ),
-        )
-        if token is None:
-            raise PeopleProvisioningError("saved account is missing an FMF token")
-
-        host = (
-            _find_first_string(
-                mobileme_data,
-                ("fmfHost", "friendsHost", "mmeFMFHost", "host", "url"),
-            )
-            or DEFAULT_FMF_HOST
-        )
-        host = _normalize_host(host)
-        caller = _string_value(_dict_path(state, "account").get("username")) or ""
-
-        headers = dict(account.get_anisette_headers(with_client_info=True))
-        headers.update(
-            {
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "User-Agent": "findmylocated/1 CFNetwork/1496.0.7 Darwin/23.5.0",
-            },
-        )
-        body = {
-            "clientContext": {
-                "appName": "findmylocated",
-                "apsToken": "",
-                "callerHandleId": caller,
-                "contextBundleApp": FINDMYLOCATED_BUNDLE,
-                "currentTime": int(time.time() * 1000),
-                "deviceUDID": device.udid,
-                "deviceDisplayName": device.display_name,
-                "productType": device.product_type,
-                "osVersion": device.os_version,
-            },
-            "serverContext": {
-                "authToken": _base64_text(token),
-                "clientId": _base64_text(device.udid),
-                "prsId": dsid,
-            },
-        }
-        response = _post_json(
-            FMF_ENDPOINT_TEMPLATE.format(
-                host=host,
-                dsid=dsid,
-                device_udid=device.udid,
-            ),
-            headers=headers,
-            auth=(dsid, token),
-            body=body,
-        )
-        self.debug_logger.emit(
-            "fmf_init_client",
-            {
-                "status": 200,
-                "dsid": dsid,
-                "fmf_host": host,
-                "response_keys": sorted(response),
-                "device_display_name": device.display_name,
-                "device_profile": device.product_type,
-                "device_profile_fallback": (
-                    device.product_type == APPLE_FALLBACK_PRODUCT_TYPE
-                ),
-                "following_count": len(response.get("following", []))
-                if isinstance(response.get("following"), list)
-                else 0,
-            },
-        )
-        return response
+        return _FMFSession(
+            account=account,
+            state=state,
+            device=device,
+            debug_logger=self.debug_logger,
+        ).initialize()
 
     def _fetch_searchparty(
         self,
@@ -540,8 +746,11 @@ class PeopleClient:
         state: dict[str, Any],
         device: DeviceIdentity,
         fm_id: str,
-        advertised_id: str,
+        advertised_id: str | None,
         apns_token: str,
+        *,
+        intent: str = "startLocationUpdates",
+        mode: str = "shallow",
     ) -> dict[str, Any]:
         login_data = _dict_path(state, "login", "data")
         dsid = _string_value(login_data.get("dsid"))
@@ -568,9 +777,9 @@ class PeopleClient:
             "fetch": [
                 {
                     "fmId": fm_id,
-                    "intent": "startLocationUpdates",
-                    "mode": "shallow",
-                    "ids": [advertised_id],
+                    "intent": intent,
+                    "mode": mode,
+                    "ids": [] if advertised_id is None else [advertised_id],
                 },
             ],
             "clientContext": {
@@ -750,6 +959,14 @@ def load_people_state(config_dir: Path) -> dict[str, Any]:
     metadata = read_json(people_config_path(config_dir)) or {}
     secrets = secret_section(config_dir, "people")
     return _merge_dicts(secrets, metadata)
+
+
+def _person_id_for_alias(state: dict[str, Any], alias: str) -> str:
+    alias_config = _dict_value(_dict_value(state.get("aliases")).get(alias))
+    person_id = _string_value(alias_config.get("person_id"))
+    if person_id is None:
+        raise PeopleLocationError("alias is not configured")
+    return person_id
 
 
 def write_people_state(config_dir: Path, state: dict[str, Any]) -> None:

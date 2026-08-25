@@ -141,6 +141,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print anonymized key diagnostics",
     )
+    people_key_acquire_parser = people_key_subparsers.add_parser(
+        "acquire",
+        help="request and receive a People location key over APNs/IDS",
+    )
+    people_key_acquire_parser.add_argument("--alias", required=True)
+    people_key_acquire_parser.add_argument(
+        "--anonomyse",
+        action="store_true",
+        help="print anonymized key readiness",
+    )
+    people_key_acquire_parser.add_argument(
+        "--wait-seconds",
+        type=int,
+        default=120,
+        help="maximum seconds to wait for key delivery (default: 120)",
+    )
+    people_key_acquire_parser.add_argument(
+        "--debug-redacted",
+        action="store_true",
+        help="print redacted protocol diagnostics to stderr",
+    )
     people_location_parser = people_subparsers.add_parser(
         "location",
         help="fetch configured People locations",
@@ -175,6 +196,7 @@ def build_parser() -> argparse.ArgumentParser:
     people_alias_setup_parser.set_defaults(_command_parser=people_alias_setup_parser)
     people_key_parser.set_defaults(_command_parser=people_key_parser)
     people_key_import_parser.set_defaults(_command_parser=people_key_import_parser)
+    people_key_acquire_parser.set_defaults(_command_parser=people_key_acquire_parser)
     people_location_parser.set_defaults(_command_parser=people_location_parser)
     people_location_get_parser.set_defaults(_command_parser=people_location_get_parser)
 
@@ -222,6 +244,7 @@ def main(argv: list[str] | None = None) -> int:
                     args._command_parser.error("apple requires a subcommand")
         case "people":
             from onitrack.people import (
+                acquire_people_key,
                 get_people_location,
                 import_people_key,
                 list_people,
@@ -266,6 +289,15 @@ def main(argv: list[str] | None = None) -> int:
                                 resolve_config_dir(args.config_dir),
                                 person_id=args.person_id,
                                 advertised_id=args.advertised_id,
+                            )
+                        case "acquire":
+                            if not args.anonomyse:
+                                args._command_parser.error("choose --anonomyse")
+                            return acquire_people_key(
+                                resolve_config_dir(args.config_dir),
+                                alias=args.alias,
+                                wait_seconds=args.wait_seconds,
+                                debug_redacted=args.debug_redacted,
                             )
                         case None:
                             args._command_parser.error(
