@@ -431,6 +431,8 @@ def test_redactor_hashes_sensitive_fields_and_removes_forbidden_values(tmp_path)
             {
                 "fmId": "fm-id-raw",
                 "dsid": "12345",
+                "alias": "private-alias",
+                "device_display_name": "private-hostname",
                 "nested": {"advertised_id": "adv-raw", "latitude": 12.5},
                 "count": 1,
             },
@@ -443,6 +445,8 @@ def test_redactor_hashes_sensitive_fields_and_removes_forbidden_values(tmp_path)
             {
                 "fmId": "fm-id-raw",
                 "dsid": "12345",
+                "alias": "private-alias",
+                "device_display_name": "private-hostname",
                 "nested": {"advertised_id": "adv-raw", "latitude": 12.5},
                 "count": 1,
             },
@@ -452,6 +456,8 @@ def test_redactor_hashes_sensitive_fields_and_removes_forbidden_values(tmp_path)
     assert "fm-id-raw" not in output
     assert "12345" not in output
     assert "adv-raw" not in output
+    assert "private-alias" not in output
+    assert "private-hostname" not in output
     assert "12.5" not in output
     assert "fmId_hmac" in output
     assert '"latitude": "<redacted>"' in output

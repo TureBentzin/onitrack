@@ -641,12 +641,16 @@ class PeopleClient:
         try:
             state = account.to_json()
             device = load_or_create_device_identity(self.config_dir)
-            from onitrack.ids import _version_ua
+            from onitrack.ids import _registration_device, _version_ua
             from onitrack.key_acquisition import PeopleKeyAcquirer
 
+            registered_device = _registration_device(
+                device,
+                _dict_value(people_state.get("ids")),
+            )
             acquirer = PeopleKeyAcquirer(
                 people_state=people_state,
-                user_agent=_version_ua(device),
+                user_agent=_version_ua(registered_device),
                 debug_emit=self.debug_logger.emit,
             )
 
@@ -654,7 +658,7 @@ class PeopleClient:
                 session = _FMFSession(
                     account=account,
                     state=state,
-                    device=device,
+                    device=registered_device,
                     debug_logger=self.debug_logger,
                     aps_token=base_token.hex(),
                 )
@@ -673,7 +677,7 @@ class PeopleClient:
                 self._fetch_searchparty(
                     account,
                     state,
-                    device,
+                    registered_device,
                     relationship.fm_id,
                     None,
                     base_token.hex(),
@@ -683,7 +687,14 @@ class PeopleClient:
                 return relationship
 
             def accept_delivery(delivery: Any) -> None:
-                parse_people_private_key_blob(delivery.private_key_blob)
+                from onitrack.key_acquisition import KeyAcquisitionError
+
+                try:
+                    parse_people_private_key_blob(delivery.private_key_blob)
+                except PeopleLocationError as exc:
+                    raise KeyAcquisitionError(
+                        "Find My P-224 key is invalid",
+                    ) from exc
                 _store_people_key(
                     self.config_dir,
                     person_id=person_id,
@@ -1205,8 +1216,11 @@ class DebugRedactor:
         "id",
         "key_id",
         "account_id",
+        "alias",
         "apple_id",
+        "device_display_name",
         "profile_id",
+        "target",
     }
     _remove_keys = {
         "authToken",

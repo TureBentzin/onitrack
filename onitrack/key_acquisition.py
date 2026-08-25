@@ -215,35 +215,54 @@ class PeopleKeyAcquirer:
                 raise KeyAcquisitionError("pypush is required for APNs") from exc
             connection_factory = apns.create_apns_connection
 
+        result: VerifiedKeyDelivery | None = None
+        failure: Exception | None = None
         async with connection_factory(
             certificate,
             private_key,
             token=stored_token,
         ) as connection:
-            base_token = await connection.base_token
-            async with AsyncExitStack() as stack:
-                streams: dict[str, Any] = {}
-                for topic in APNS_INTEREST_TOPICS:
-                    streams[topic] = await stack.enter_async_context(
-                        connection.notification_stream(topic, base_token),
+            try:
+                base_token = await connection.base_token
+                async with AsyncExitStack() as stack:
+                    streams: dict[str, Any] = {}
+                    for topic in APNS_INTEREST_TOPICS:
+                        streams[topic] = await stack.enter_async_context(
+                            connection.notification_stream(topic, base_token),
+                        )
+                    self.debug_emit(
+                        "people_key_subscribed",
+                        {
+                            "topic_count": len(streams),
+                            "apns_token": base_token.hex(),
+                        },
                     )
-                self.debug_emit(
-                    "people_key_subscribed",
-                    {"topic_count": len(streams), "apns_token": base_token.hex()},
-                )
-                relationship = prepare_delivery(base_token)
-                self.debug_emit(
-                    "people_key_delivery_requested",
-                    {"fmId": relationship.fm_id, "wait_seconds": wait_seconds},
-                )
-                return await self._wait_for_delivery(
-                    connection,
-                    streams=streams,
-                    base_token=base_token,
-                    relationship=relationship,
-                    wait_seconds=wait_seconds,
-                    accept_delivery=accept_delivery,
-                )
+                    relationship = await asyncio.to_thread(
+                        prepare_delivery,
+                        base_token,
+                    )
+                    self.debug_emit(
+                        "people_key_delivery_requested",
+                        {
+                            "fmId": relationship.fm_id,
+                            "wait_seconds": wait_seconds,
+                        },
+                    )
+                    result = await self._wait_for_delivery(
+                        connection,
+                        streams=streams,
+                        base_token=base_token,
+                        relationship=relationship,
+                        wait_seconds=wait_seconds,
+                        accept_delivery=accept_delivery,
+                    )
+            except Exception as exc:
+                failure = exc
+        if failure is not None:
+            raise failure
+        if result is None:
+            raise KeyAcquisitionError("key acquisition ended without a result")
+        return result
 
     async def _wait_for_delivery(
         self,
@@ -299,7 +318,7 @@ class PeopleKeyAcquirer:
                             directory=self.directory,
                             ids_state=self.ids_state,
                         )
-                        accept_delivery(delivery)
+                        await asyncio.to_thread(accept_delivery, delivery)
                     except KeyAcquisitionError as exc:
                         self.debug_emit(
                             "people_key_delivery_rejected",

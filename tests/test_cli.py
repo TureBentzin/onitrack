@@ -98,6 +98,27 @@ def test_people_key_import_requires_anonymized_mode(capsys):
     assert "choose --anonomyse" in error
 
 
+def test_people_key_acquire_requires_anonymized_mode(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["people", "key", "acquire", "--alias", "home"])
+
+    assert exc.value.code == 2
+    error = capsys.readouterr().err
+    assert "usage: onitrack people key acquire" in error
+    assert "choose --anonomyse" in error
+
+
+def test_people_key_acquire_exposes_wait_and_redacted_debug_help(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["people", "key", "acquire", "--help"])
+
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    assert "--wait-seconds" in output
+    assert "--debug-redacted" in output
+    assert "--anonomyse" in output
+
+
 def test_people_requires_subcommand_uses_people_usage(capsys):
     with pytest.raises(SystemExit) as exc:
         main(["people"])
