@@ -174,9 +174,11 @@ def test_fmf_sequence_carries_contexts_model_and_exact_fetch(monkeypatch, tmp_pa
         return next(responses)
 
     monkeypatch.setattr(people_module, "_post_json", fake_post)
-    account = SimpleNamespace(
-        get_anisette_headers=lambda **_kwargs: {"X-Test": "anisette"},
-    )
+    def anisette_headers(*, with_client_info):
+        assert with_client_info is False
+        return {"X-Test": "anisette"}
+
+    account = SimpleNamespace(get_anisette_headers=anisette_headers)
     state = {
         "account": {"username": "receiver@example.invalid"},
         "login": {
@@ -192,6 +194,7 @@ def test_fmf_sequence_carries_contexts_model_and_exact_fetch(monkeypatch, tmp_pa
     device = DeviceIdentity(
         udid="00000000-0000-0000-0000-000000000001",
         display_name="synthetic",
+        fmf_udid="A" * 64,
     )
     session = _FMFSession(
         account=account,
@@ -223,12 +226,36 @@ def test_fmf_sequence_carries_contexts_model_and_exact_fetch(monkeypatch, tmp_pa
     assert "/minCallback/refreshClient" in calls[1][0]
     assert "/minCallback/selFriend/refreshClient" in calls[2][0]
     assert all(call[1]["X-FMF-Model-Version"] == "1" for call in calls[:3])
+    assert all(
+        call[1]["User-Agent"] == "FMFD/1.0 com.apple.iCloudHelper/282"
+        for call in calls[:3]
+    )
+    assert all("X-Apple-App-Info" not in call[1] for call in calls)
+    assert all("X-Xcode-Version" not in call[1] for call in calls)
+    assert all(call[1]["X-Apple-Find-API-Ver"] == "2.0" for call in calls[:3])
+    assert all(call[1]["X-Apple-AuthScheme"] == "Forever" for call in calls[:3])
+    assert all(
+        call[1]["X-MMe-Client-Info"]
+        == (
+            "<Macmini9,1> <macOS;14.6;23G80> "
+            "<com.apple.AuthKit/1 (com.apple.findmy/375.20)>"
+        )
+        for call in calls[:3]
+    )
+    assert calls[0][3]["clientContext"]["selectedFriend"] is None
     assert calls[1][3]["serverContext"] == {"server": 1}
     assert calls[1][3]["dataContext"] == {"data": 1}
     assert calls[2][3]["serverContext"] == {"server": 2}
     assert calls[2][3]["dataContext"] == {"data": 2}
     assert calls[2][3]["clientContext"]["selectedFriend"] == "fm-selected"
+    assert ("A" * 64) in calls[0][0]
+    assert calls[0][3]["clientContext"]["deviceUDID"] == "a" * 64
     assert calls[3][3]["clientContext"]["apsToken"] == "base-courier-token"
+    assert calls[3][3]["clientContext"]["clientId"] == "a" * 64
+    assert calls[3][1]["accept-version"] == "4"
+    assert calls[3][1]["x-apple-i-device-type"] == "1"
+    assert calls[3][1]["x-apple-setup-proxy-request"] == "true"
+    assert calls[3][1]["User-Agent"].startswith("searchpartyuseragent/1 ")
     assert calls[3][3]["fetch"] == [
         {
             "fmId": "fm-selected",

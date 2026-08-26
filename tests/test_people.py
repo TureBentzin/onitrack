@@ -8,6 +8,7 @@ import pytest
 
 from onitrack.main import main
 from onitrack.people import (
+    _contains_identifier,
     DebugRedactor,
     LocationFix,
     PeopleClient,
@@ -689,8 +690,21 @@ def test_device_identity_is_persisted_with_private_mode(tmp_path):
     assert identity.display_name.startswith("onitrack")
     assert identity.product_type == "Macmini9,1"
     assert identity.os_version == "14.6"
+    assert len(identity.fmf_udid) == 64
+    assert identity.fmf_udid == identity.fmf_udid.upper()
     assert load_or_create_device_identity(tmp_path) == identity
     assert device_config_path(tmp_path).stat().st_mode & 0o777 == CONFIG_FILE_MODE
+
+
+def test_contains_identifier_ignores_uuid_separators():
+    assert _contains_identifier(
+        {"deviceUDID": "00000000-0000-0000-0000-000000000001"},
+        "00000000000000000000000000000001",
+    )
+    assert not _contains_identifier(
+        {"deviceUDID": "00000000-0000-0000-0000-000000000002"},
+        "00000000000000000000000000000001",
+    )
 
 
 def test_default_display_name_uses_hostname_and_falls_back_to_onitrack(monkeypatch):

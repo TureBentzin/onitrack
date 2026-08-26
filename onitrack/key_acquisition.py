@@ -81,6 +81,75 @@ class IDSDirectoryClient:
         target: str,
         sender_token: bytes,
     ) -> DirectoryIdentity:
+        directory = await self._query_directory(
+            connection,
+            base_token=base_token,
+            topic=topic,
+            sender=sender,
+            target=target,
+        )
+        return select_directory_identity(
+            directory,
+            sender=sender,
+            sender_token=sender_token,
+        )
+
+    async def query_participant_summary(
+        self,
+        connection: Any,
+        *,
+        base_token: bytes,
+        topic: str,
+        sender: str,
+        target: str,
+    ) -> tuple[int, int]:
+        directory = await self._query_directory(
+            connection,
+            base_token=base_token,
+            topic=topic,
+            sender=sender,
+            target=target,
+        )
+        if directory.get("status") != 0:
+            raise KeyAcquisitionError(
+                "IDS directory response status is "
+                f"{_safe_status(directory.get('status'))}",
+            )
+        sender_result = _dict_value(
+            _dict_value(directory.get("results")).get(sender),
+        )
+        identities = sender_result.get("identities")
+        if not isinstance(identities, list):
+            return 0, 0
+        ngm_count = sum(
+            1
+            for identity in identities
+            if isinstance(identity, dict)
+            and isinstance(
+                _dict_value(identity.get("client-data")).get(
+                    "public-message-ngm-device-prekey-data-key",
+                ),
+                bytes,
+            )
+            and isinstance(
+                identity.get("kt-loggable-data")
+                or _dict_value(identity.get("client-data")).get(
+                    "ngm-public-identity",
+                ),
+                bytes,
+            )
+        )
+        return len(identities), ngm_count
+
+    async def _query_directory(
+        self,
+        connection: Any,
+        *,
+        base_token: bytes,
+        topic: str,
+        sender: str,
+        target: str,
+    ) -> dict[str, Any]:
         user = _registered_user_for_target(self.ids_state, target)
         body = gzip.compress(
             plistlib.dumps({"uris": [sender]}, fmt=plistlib.FMT_XML),
@@ -142,13 +211,8 @@ class IDSDirectoryClient:
                     )
                 decoded = _maybe_gunzip(encoded, "IDS directory response")
                 directory = _load_plist(decoded, "IDS directory response")
-                identity = select_directory_identity(
-                    directory,
-                    sender=sender,
-                    sender_token=sender_token,
-                )
                 await connection.ack(command)
-                return identity
+                return directory
 
     async def send_application_ack(
         self,
@@ -249,11 +313,23 @@ class PeopleKeyAcquirer:
                         prepare_delivery,
                         base_token,
                     )
+                    if self.receiver_preflight:
+                        await self._run_sender_preflight(
+                            connection,
+                            base_token,
+                            relationship,
+                        )
                     self.debug_emit(
                         "people_key_delivery_requested",
                         {
                             "fmId": relationship.fm_id,
                             "wait_seconds": wait_seconds,
+                            "secure_locations_capable": (
+                                relationship.secure_locations_capable
+                            ),
+                            "fallback_to_legacy_allowed": (
+                                relationship.fallback_to_legacy_allowed
+                            ),
                         },
                     )
                     result = await self._wait_for_delivery(
@@ -297,6 +373,51 @@ class PeopleKeyAcquirer:
             )
             return
         self.debug_emit("ids_receiver_preflight", {"status": "ready"})
+
+    async def _run_sender_preflight(
+        self,
+        connection: Any,
+        base_token: bytes,
+        relationship: Any,
+    ) -> None:
+        target = _registered_self_handle(self.ids_state)
+        identity_count = 0
+        ngm_identity_count = 0
+        queried_handle_count = 0
+        failed_handle_count = 0
+        incompatible_handle_count = 0
+        for sender in relationship.accepted_handles:
+            directory_sender = _ids_directory_uri(sender)
+            try:
+                identities, ngm_identities = await asyncio.wait_for(
+                    self.directory.query_participant_summary(
+                        connection,
+                        base_token=base_token,
+                        topic=MULTIPLEX_SUB_SERVICES[0],
+                        sender=directory_sender,
+                        target=target,
+                    ),
+                    timeout=10,
+                )
+            except (KeyAcquisitionError, TimeoutError) as exc:
+                failed_handle_count += 1
+                if "status is 6001" in str(exc):
+                    incompatible_handle_count += 1
+                continue
+            queried_handle_count += 1
+            identity_count += identities
+            ngm_identity_count += ngm_identities
+        self.debug_emit(
+            "ids_sender_preflight",
+            {
+                "status": "ready" if queried_handle_count else "failed",
+                "queried_handle_count": queried_handle_count,
+                "failed_handle_count": failed_handle_count,
+                "incompatible_handle_count": incompatible_handle_count,
+                "identity_count": identity_count,
+                "ngm_identity_count": ngm_identity_count,
+            },
+        )
 
     async def _wait_for_delivery(
         self,
@@ -901,6 +1022,17 @@ def _normalize_handle(value: str) -> str:
             normalized = normalized[len(prefix) :]
             break
     return normalized.casefold()
+
+
+def _ids_directory_uri(value: str) -> str:
+    normalized = value.strip()
+    if normalized.lower().startswith(("mailto:", "tel:")):
+        return normalized
+    if "@" in normalized:
+        return f"mailto:{normalized}"
+    if normalized.startswith("+") or normalized.replace(" ", "").isdigit():
+        return f"tel:{normalized}"
+    return normalized
 
 
 def _base64_bytes(value: Any, label: str) -> bytes:

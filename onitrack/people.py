@@ -79,6 +79,7 @@ class DeviceIdentity:
     display_name: str
     product_type: str = APPLE_PRODUCT_TYPE
     os_version: str = APPLE_OS_VERSION
+    fmf_udid: str = ""
 
 
 @dataclass(frozen=True)
@@ -446,16 +447,13 @@ class _FMFSession:
         )
         self.account = account
         self.device = device
+        self.client_udid = getattr(device, "fmf_udid", "") or device.udid
         self.debug_logger = debug_logger
         self.aps_token = aps_token
         self.caller = (
             _string_value(_dict_path(state, "account").get("username")) or ""
         )
-        self.server_context: Any = {
-            "authToken": _base64_text(self.token),
-            "clientId": _base64_text(device.udid),
-            "prsId": self.dsid,
-        }
+        self.server_context: Any = {}
         self.data_context: Any = {}
 
     def initialize(self) -> dict[str, Any]:
@@ -477,13 +475,32 @@ class _FMFSession:
     ) -> dict[str, Any]:
         from onitrack.ids import _device_build
 
-        headers = dict(self.account.get_anisette_headers(with_client_info=True))
+        headers = dict(self.account.get_anisette_headers(with_client_info=False))
+        anisette_device_id = next(
+            (
+                str(value)
+                for key, value in headers.items()
+                if key.casefold() == "x-mme-device-id" and value
+            ),
+            "",
+        )
         headers.update(
             {
                 "Accept": "application/json",
+                "Accept-Language": "en-US,en;q=0.9",
                 "Content-Type": "application/json",
-                "User-Agent": "FMFD/1.0",
+                "User-Agent": "FMFD/1.0 com.apple.iCloudHelper/282",
+                "X-Apple-AuthScheme": "Forever",
+                "X-Apple-Find-API-Ver": "2.0",
+                "X-Apple-I-Locale": "en_US",
+                "X-Apple-Realm-Support": "1.0",
                 "X-FMF-Model-Version": FMF_MODEL_VERSION,
+                "X-MMe-Client-Info": (
+                    f"<{self.device.product_type}> "
+                    f"<macOS;{self.device.os_version};"
+                    f"{_device_build(self.device)}> "
+                    "<com.apple.AuthKit/1 (com.apple.findmy/375.20)>"
+                ),
             },
         )
         client_context = {
@@ -495,7 +512,7 @@ class _FMFSession:
             "currentTime": time.time(),
             "deviceClass": "Mac",
             "deviceHasPasscode": True,
-            "deviceUDID": self.device.udid.lower(),
+            "deviceUDID": self.client_udid.lower(),
             "fencingEnabled": True,
             "isFMFAppRemoved": False,
             "osVersion": self.device.os_version,
@@ -503,12 +520,11 @@ class _FMFSession:
             "processId": str(os.getpid()),
             "productType": self.device.product_type,
             "regionCode": "US",
+            "selectedFriend": selected_fm_id,
             "signedInAs": self.caller,
             "timezone": "UTC, 0",
             "unlockState": 0,
         }
-        if selected_fm_id is not None:
-            client_context["selectedFriend"] = selected_fm_id
         body = {
             "clientContext": client_context,
             "dataContext": self.data_context,
@@ -518,7 +534,7 @@ class _FMFSession:
             FMF_ENDPOINT_TEMPLATE.format(
                 host=self.host,
                 dsid=self.dsid,
-                device_udid=self.device.udid,
+                device_udid=self.client_udid,
                 path=path,
             ),
             headers=headers,
@@ -529,6 +545,13 @@ class _FMFSession:
             self.server_context = response["serverContext"]
         if "dataContext" in response:
             self.data_context = response["dataContext"]
+        devices = response.get("devices")
+        matching_devices = [
+            item
+            for item in devices
+            if isinstance(item, dict)
+            and _contains_string(item, self.device.display_name)
+        ] if isinstance(devices, list) else []
         self.debug_logger.emit(
             "fmf_request",
             {
@@ -544,6 +567,34 @@ class _FMFSession:
                 "device_profile_fallback": (
                     self.device.product_type == APPLE_FALLBACK_PRODUCT_TYPE
                 ),
+                "device_count": len(devices) if isinstance(devices, list) else 0,
+                "client_device_present": _contains_string(
+                    devices,
+                    self.client_udid,
+                ),
+                "ids_device_present": _contains_identifier(
+                    devices,
+                    self.device.udid,
+                ),
+                "anisette_device_present": bool(anisette_device_id)
+                and _contains_identifier(devices, anisette_device_id),
+                "client_display_name_present": bool(matching_devices),
+                "client_device_keys": sorted(
+                    {
+                        key
+                        for item in matching_devices
+                        for key in item
+                        if isinstance(key, str)
+                    },
+                ),
+                "client_device_identifiers": [
+                    {
+                        key: item[key]
+                        for key in ("id", "deviceId", "deviceUDID", "udid")
+                        if key in item
+                    }
+                    for item in matching_devices
+                ],
                 "following_count": len(response.get("following", []))
                 if isinstance(response.get("following"), list)
                 else 0,
@@ -777,6 +828,8 @@ class PeopleClient:
         intent: str = "startLocationUpdates",
         mode: str = "shallow",
     ) -> dict[str, Any]:
+        from onitrack.ids import _device_build
+
         login_data = _dict_path(state, "login", "data")
         dsid = _string_value(login_data.get("dsid"))
         if dsid is None:
@@ -790,12 +843,23 @@ class PeopleClient:
                 "saved account is missing a SearchParty token",
             )
 
-        headers = dict(account.get_anisette_headers(with_client_info=True))
+        headers = dict(account.get_anisette_headers(with_client_info=False))
         headers.update(
             {
                 "Accept": "application/json",
+                "accept-version": "4",
                 "Content-Type": "application/json",
-                "User-Agent": "findmylocated/1 CFNetwork/1496.0.7 Darwin/23.5.0",
+                "User-Agent": (
+                    f"searchpartyuseragent/1 {device.product_type}/"
+                    f"{device.os_version}"
+                ),
+                "X-MMe-Client-Info": (
+                    f"<{device.product_type}> <macOS;{device.os_version};"
+                    f"{_device_build(device)}> "
+                    "<com.apple.icloud.searchpartyuseragent/1.0>"
+                ),
+                "x-apple-i-device-type": "1",
+                "x-apple-setup-proxy-request": "true",
             },
         )
         body = {
@@ -809,7 +873,9 @@ class PeopleClient:
             ],
             "clientContext": {
                 "apsToken": apns_token,
-                "clientId": device.udid,
+                "clientId": (
+                    getattr(device, "fmf_udid", "") or device.udid
+                ).lower(),
                 "contextApp": FINDMYLOCATED_BUNDLE,
                 "deviceDisplayName": device.display_name,
                 "productType": device.product_type,
@@ -1234,6 +1300,9 @@ class DebugRedactor:
         "alias",
         "apple_id",
         "device_display_name",
+        "deviceId",
+        "deviceUDID",
+        "udid",
         "profile_id",
         "target",
     }
@@ -1325,22 +1394,30 @@ def load_or_create_device_identity(config_dir: Path) -> DeviceIdentity:
         product_type = _string_value(state.get("product_type")) or APPLE_PRODUCT_TYPE
         os_version = _string_value(state.get("os_version")) or APPLE_OS_VERSION
         if udid:
+            fmf_udid = _string_value(state.get("fmf_udid"))
+            if fmf_udid is None:
+                fmf_udid = os.urandom(32).hex().upper()
+                write_json_atomic(path, {**state, "fmf_udid": fmf_udid})
+                path.chmod(CONFIG_FILE_MODE)
             return DeviceIdentity(
                 udid=udid,
                 display_name=display_name,
                 product_type=product_type,
                 os_version=os_version,
+                fmf_udid=fmf_udid,
             )
 
     ensure_config_dir(config_dir)
     identity = DeviceIdentity(
         udid=uuid.uuid4().hex.upper(),
         display_name=default_display_name(),
+        fmf_udid=os.urandom(32).hex().upper(),
     )
     write_json_atomic(
         path,
         {
             "display_name": identity.display_name,
+            "fmf_udid": identity.fmf_udid,
             "os_version": identity.os_version,
             "product_type": identity.product_type,
             "udid": identity.udid,
@@ -1489,8 +1566,26 @@ def _safe_integer(value: Any) -> int | str:
     return "unknown"
 
 
-def _base64_text(value: str) -> str:
-    return base64.b64encode(value.encode("utf-8")).decode("ascii")
+def _contains_string(value: Any, expected: str) -> bool:
+    if isinstance(value, str):
+        return value.casefold() == expected.casefold()
+    if isinstance(value, dict):
+        return any(_contains_string(child, expected) for child in value.values())
+    if isinstance(value, list):
+        return any(_contains_string(child, expected) for child in value)
+    return False
+
+
+def _contains_identifier(value: Any, expected: str) -> bool:
+    normalized = "".join(character for character in expected if character.isalnum())
+    if isinstance(value, str):
+        candidate = "".join(character for character in value if character.isalnum())
+        return bool(normalized) and candidate.casefold() == normalized.casefold()
+    if isinstance(value, dict):
+        return any(_contains_identifier(child, expected) for child in value.values())
+    if isinstance(value, list):
+        return any(_contains_identifier(child, expected) for child in value)
+    return False
 
 
 def _coordinate_digest_input(latitude: float, longitude: float) -> str:

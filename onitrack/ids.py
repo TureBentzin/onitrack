@@ -859,6 +859,7 @@ def _generate_validation_data() -> bytes:
 def _nac_device(device: Any) -> Any:
     return SimpleNamespace(
         display_name=device.display_name,
+        fmf_udid=getattr(device, "fmf_udid", ""),
         os_build=_macos_build(NAC_OS_VERSION),
         os_version=NAC_OS_VERSION,
         product_type=NAC_PRODUCT_TYPE,
@@ -878,6 +879,7 @@ def _registration_device(device: Any, state: dict[str, Any]) -> Any:
     if product_type and os_version and os_build:
         return SimpleNamespace(
             display_name=device.display_name,
+            fmf_udid=getattr(device, "fmf_udid", ""),
             os_build=os_build,
             os_version=os_version,
             product_type=product_type,
